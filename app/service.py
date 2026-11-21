@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, load_env_file
 from app.generation.generator import GenerationResult, Generator
 from app.ingestion.indexer import Ingestor, IngestStats
 from app.observability.tracing import Tracer, TraceRecord, estimate_cost
@@ -27,6 +27,8 @@ class Service:
     """Composition root. One instance per process, thread-safe for reads."""
 
     def __init__(self, settings: Settings | None = None) -> None:
+        # make `.env` provider keys visible even when constructed directly
+        load_env_file()
         self.settings = settings or get_settings()
         self.embedder: Embedder = build_embedder(
             self.settings.embedding_provider,
@@ -136,6 +138,18 @@ class Service:
         if trace:
             self.tracer.record(record)
         return result, record
+
+    def stale_index_notice(self) -> str | None:
+        """Human-readable warning if an incompatible index was set aside at startup."""
+        store = self.store
+        reason = getattr(store, "quarantined_reason", None)
+        dest = getattr(store, "quarantined_to", None)
+        if not reason:
+            return None
+        return (
+            f"The existing index could not be used ({reason}). It was moved to "
+            f"{dest} and an empty index is being served. Run ingestion to rebuild."
+        )
 
     def health(self) -> dict[str, object]:
         return {

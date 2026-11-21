@@ -117,8 +117,25 @@ make eval-mistral      # real-provider evaluation
 
 Switching provider/model without re-ingesting is caught rather than silently
 producing garbage: the store records `provider:model` and the vector dimension
-in `data/index/index_meta.json` and refuses to load a mismatched index. The
-Mistral embedder also validates the returned dimension on every call.
+in `data/index/index_meta.json`. On a mismatch it **quarantines** the old index
+(moves it to `data/index.stale-<timestamp>`) and starts empty, printing a
+warning, so `make ingest` can rebuild. It deliberately does not raise: raising at
+load time would make the recommended remedy impossible, because ingest loads the
+store too.
+
+Provider keys are read from `os.environ`, not via `Settings`, so `.env` is
+exported into the environment at startup; a key that exists only in `.env` is
+otherwise invisible. Real environment variables take precedence over `.env`.
+
+Provider failures are reported as a single actionable message rather than a
+traceback, e.g.:
+
+```
+401 from https://api.mistral.ai/v1/embeddings
+  detail: Your API key expired on 2026-11-21.
+  MISTRAL_API_KEY is missing, invalid, or expired.
+  Check the key at https://console.mistral.ai/ ...
+```
 
 Mistral calls retry on 429/5xx and transport errors with exponential backoff, and
 the chat client uses `response_format=json_object` so strict-mode parsing is
@@ -214,7 +231,7 @@ placeholder so everything runs without keys.
 
 ## Tests
 
-95 tests, no network, no API keys, no Docker (`pytest`, ~2s):
+107 tests, no network, no API keys, no Docker (`pytest`, ~2s):
 
 - **ingestion** — MDX cleaning, frontmatter, heading-aware chunking, chunk-id
   stability, oversized splitting, QC rules (short/duplicate/missing metadata),
@@ -253,7 +270,7 @@ app/
   providers.py    embedder / llm / reranker interfaces + implementations
   service.py      composition root
 eval/             dataset.jsonl, run_eval.py, reports/
-tests/            95 tests
+tests/            107 tests
 scripts/          ingest_cli.py, fetch_corpus.sh
 Dockerfile · docker-compose.yml · .github/workflows/ci.yml · Makefile
 ```

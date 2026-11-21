@@ -26,7 +26,10 @@ def _service() -> Service:
 
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse.model_validate(_service().health())
+    service = _service()
+    payload = service.health()
+    payload["warning"] = service.stale_index_notice()
+    return HealthResponse.model_validate(payload)
 
 
 @router.post("/ask", response_model=AskResponse)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from app.config import Settings
 from app.ingestion.chunker import chunk_document
 from app.ingestion.parser import clean_markdown, discover_docs, parse_file
@@ -239,3 +240,33 @@ def test_oversized_single_code_block_is_kept_whole(tmp_path: Path) -> None:
     chunks = chunk_document(doc, settings)
     assert len(chunks) == 1
     assert chunks[0].text.count("```") == 2
+
+
+def test_env_file_is_exported_for_provider_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key placed only in .env must reach providers, which read os.environ."""
+    import os
+
+    from app.config import load_env_file
+
+    env = tmp_path / ".env"
+    env.write_text('MISTRAL_API_KEY="abc123"  # inline comment\nOTHER=plain\n')
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("OTHER", raising=False)
+
+    load_env_file(env)
+    assert os.environ["MISTRAL_API_KEY"] == "abc123"
+    assert os.environ["OTHER"] == "plain"
+
+
+def test_real_env_wins_over_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from app.config import load_env_file
+
+    env = tmp_path / ".env"
+    env.write_text("MISTRAL_API_KEY=from-file\n")
+    monkeypatch.setenv("MISTRAL_API_KEY", "from-shell")
+    load_env_file(env)
+    assert os.environ["MISTRAL_API_KEY"] == "from-shell"

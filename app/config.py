@@ -2,10 +2,34 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_ENV_FILE = Path(".env")
+
+
+def load_env_file(path: Path = _ENV_FILE) -> None:
+    """Export `.env` into os.environ.
+
+    Provider keys (MISTRAL_API_KEY) are read via os.environ, not through
+    Settings, so a key placed only in `.env` would otherwise be invisible and
+    every API call would fail claiming the key is missing. Real environment
+    variables win over `.env`, matching pydantic-settings precedence.
+    """
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.split(" #", 1)[0].strip().strip("'\"")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
 
 
 class Settings(BaseSettings):
@@ -58,4 +82,5 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    load_env_file()
     return Settings()

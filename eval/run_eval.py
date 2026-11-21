@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.config import Settings
+from app.config import Settings, load_env_file
 from app.models import ScoredChunk
 from app.retrieval.pipeline import RetrievalConfig
 from app.service import Service
@@ -522,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    load_env_file()
     questions = load_dataset(limit=args.limit)
     variants = DEFAULT_VARIANTS
     if args.variants:

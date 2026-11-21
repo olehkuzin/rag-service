@@ -143,10 +143,45 @@ def _post_with_retry(url: str, headers: dict[str, str], json: dict[str, object])
     )
     def _do() -> Any:
         resp = httpx.post(url, headers=headers, json=json, timeout=60.0)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # Retryable statuses must keep bubbling as HTTPStatusError so the
+            # retry policy can act on them; only terminal ones become ProviderError.
+            if resp.status_code in {429, 500, 502, 503, 504}:
+                resp.raise_for_status()
+            raise ProviderError(_describe_http_error(resp, url))
         return resp
 
     return _do()
+
+
+class ProviderError(RuntimeError):
+    """Provider call failed with an actionable, user-facing message."""
+
+
+def _describe_http_error(resp: Any, url: str) -> str:
+    """Turn a provider HTTP error into something a human can act on."""
+    try:
+        detail = resp.json().get("detail") or resp.json().get("message")
+    except Exception:
+        detail = resp.text[:300]
+
+    status = resp.status_code
+    if status in {401, 403}:
+        hint = (
+            "MISTRAL_API_KEY is missing, invalid, or expired.\n"
+            "  Check the key at https://console.mistral.ai/ and put the current "
+            "value in .env as MISTRAL_API_KEY=..."
+        )
+    elif status == 402:
+        hint = "Mistral account has no remaining credit; check plan/billing."
+    elif status == 404:
+        hint = "Model or endpoint not found; check RAG_EMBEDDING_MODEL / RAG_LLM_MODEL."
+    elif status == 422:
+        hint = "Mistral rejected the request payload (often a bad model name or input)."
+    else:
+        hint = "Unexpected provider error."
+
+    return f"{status} from {url}\n  detail: {detail}\n  {hint}"
 
 
 def build_embedder(provider: str, model: str, dim: int) -> Embedder:

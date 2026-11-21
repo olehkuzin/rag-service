@@ -10,7 +10,8 @@ import argparse
 import json
 import sys
 
-from app.config import Settings
+from app.config import get_settings
+from app.providers import ProviderError
 from app.service import Service
 
 
@@ -30,10 +31,18 @@ def main(argv: list[str] | None = None) -> int:
     ask.add_argument("--variant", choices=["basic", "strict"], default=None)
 
     args = parser.parse_args(argv)
-    service = Service(Settings())
+    service = Service(get_settings())
+
+    notice = service.stale_index_notice()
+    if notice:
+        print(f"warning: {notice}\n", file=sys.stderr)
 
     if args.command == "ingest":
-        stats = service.ingest(force=args.force, limit=args.limit)
+        try:
+            stats = service.ingest(force=args.force, limit=args.limit)
+        except ProviderError as exc:
+            print(f"\ningestion failed:\n{exc}\n", file=sys.stderr)
+            return 3
         print(json.dumps(stats.summary(), indent=2))
         return 0
 
@@ -49,9 +58,13 @@ def main(argv: list[str] | None = None) -> int:
         print("index is empty — run `ingest` first", file=sys.stderr)
         return 1
 
-    result, trace = service.ask(
-        args.question, top_k=args.top_k, config=config, prompt_variant=args.variant
-    )
+    try:
+        result, trace = service.ask(
+            args.question, top_k=args.top_k, config=config, prompt_variant=args.variant
+        )
+    except ProviderError as exc:
+        print(f"\nquery failed:\n{exc}\n", file=sys.stderr)
+        return 3
     print(result.answer or "(no answer)")
     print()
     print(

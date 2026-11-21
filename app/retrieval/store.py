@@ -9,6 +9,8 @@ used in local deployments. `QdrantVectorStore` is an optional adapter (requires
 from __future__ import annotations
 
 import json
+import shutil
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -45,40 +47,62 @@ class LocalVectorStore:
         self.embedding_id = embedding_id
         self._vectors: np.ndarray = np.zeros((0, dim), dtype=np.float32)
         self._payloads: list[dict[str, Any]] = []
+        # set by load() when an incompatible index was set aside
+        self.quarantined_reason: str | None = None
+        self.quarantined_to: Path | None = None
 
     # -- persistence -------------------------------------------------------
     def load(self) -> None:
+        """Load a persisted index, quarantining it if it cannot be used.
+
+        An incompatible or corrupt index must not brick the process: every
+        command would fail at load time, *including* `ingest --force` that is
+        supposed to repair it. So instead of raising, we move the bad index
+        aside (so `--force` can rebuild cleanly) and start empty.
+        """
         vec_file = self.path / "vectors.npy"
         meta_file = self.path / "payloads.json"
         if not (vec_file.exists() and meta_file.exists()):
             return
-        # Validate before assigning: a dim mismatch (e.g. switching the embedding
-        # provider without re-ingesting) must fail loudly, not corrupt retrieval.
-        vectors = np.load(vec_file)
-        if vectors.ndim != 2 or vectors.shape[1] != self.dim:
-            raise ValueError(
-                f"persisted index at {self.path} has dimension "
-                f"{vectors.shape[1] if vectors.ndim == 2 else 'unknown'}, "
-                f"but the configured embedding dimension is {self.dim}. "
-                "Re-ingest with --force after changing embedding providers."
-            )
-        manifest_file = self.path / "index_meta.json"
-        if manifest_file.exists() and self.embedding_id:
-            meta = json.loads(manifest_file.read_text(encoding="utf-8"))
-            stored = meta.get("embedding_id")
-            if stored and stored != self.embedding_id:
+
+        try:
+            vectors = np.load(vec_file)
+            self._check_compatible(vectors)
+            payloads = json.loads(meta_file.read_text(encoding="utf-8"))
+            if len(payloads) != len(vectors):
                 raise ValueError(
-                    f"index was built with {stored!r} but configured embedding is "
-                    f"{self.embedding_id!r}. Re-ingest with --force."
+                    f"index is inconsistent: {len(vectors)} vectors vs {len(payloads)} payloads"
                 )
+        except ValueError as exc:
+            self._quarantine(reason=str(exc))
+            return
 
         self._vectors = vectors
-        self._payloads = json.loads(meta_file.read_text(encoding="utf-8"))
-        if len(self._payloads) != len(self._vectors):
+        self._payloads = payloads
+
+    def _check_compatible(self, vectors: np.ndarray) -> None:
+        actual = vectors.shape[1] if vectors.ndim == 2 else None
+        if actual != self.dim:
             raise ValueError(
-                f"index is inconsistent: {len(self._vectors)} vectors vs "
-                f"{len(self._payloads)} payloads. Re-ingest with --force."
+                f"persisted index dimension {actual or 'unknown'} != configured {self.dim}"
             )
+        meta_file = self.path / "index_meta.json"
+        if meta_file.exists() and self.embedding_id:
+            stored = json.loads(meta_file.read_text(encoding="utf-8")).get("embedding_id")
+            if stored and stored != self.embedding_id:
+                raise ValueError(f"index built with {stored!r} != configured {self.embedding_id!r}")
+
+    def _quarantine(self, reason: str) -> None:
+        """Move an unusable index aside so it is not silently reused."""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = self.path.with_name(f"{self.path.name}.stale-{stamp}")
+        try:
+            self.path.rename(dest)
+        except OSError:  # pragma: no cover - filesystem edge case
+            shutil.rmtree(self.path, ignore_errors=True)
+            dest = self.path
+        self.quarantined_reason = reason
+        self.quarantined_to = dest
 
     def save(self) -> None:
         self.path.mkdir(parents=True, exist_ok=True)

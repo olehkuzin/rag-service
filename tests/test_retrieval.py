@@ -145,48 +145,59 @@ def test_retriever_doc_filter(service: Service) -> None:
     assert all(c.chunk.doc_id in doc_ids for c in result.chunks)
 
 
-def test_store_rejects_dim_mismatch_on_load(tmp_path) -> None:
-    """Switching embedding providers without re-ingesting must fail loudly."""
-    path = tmp_path / "s"
-    store = LocalVectorStore(path, dim=8)
-    store.upsert([_chunk("a", "text")], np.zeros((1, 8), np.float32))
-    store.save()
+def test_incompatible_index_is_quarantined_not_fatal(tmp_path) -> None:
+    """A stale index must never brick `ingest --force`.
 
-    import pytest
+    Regression test: load() used to raise on a dimension mismatch, which made
+    the recommended remedy (re-ingest) impossible, since ingest also loads.
+    """
+    path = tmp_path / "index"
+    old = LocalVectorStore(path, dim=8, embedding_id="hash:local")
+    old.upsert([_chunk("a", "text")], np.zeros((1, 8), np.float32))
+    old.save()
 
-    wrong = LocalVectorStore(path, dim=4)
-    with pytest.raises(ValueError, match="dimension"):
-        wrong.load()
+    new = LocalVectorStore(path, dim=4, embedding_id="mistral:mistral-embed")
+    new.load()  # must not raise
+
+    assert new.count() == 0, "stale index should not be served"
+    assert new.quarantined_reason is not None
+    assert new.quarantined_to is not None and new.quarantined_to.exists()
+    assert not path.exists(), "stale dir is moved aside, leaving a clean path"
+
+    # and the fresh store is fully usable
+    new.upsert([_chunk("b", "text")], np.zeros((1, 4), np.float32))
+    new.save()
+    reloaded = LocalVectorStore(path, dim=4, embedding_id="mistral:mistral-embed")
+    reloaded.load()
+    assert reloaded.count() == 1
+    assert reloaded.quarantined_reason is None
 
 
-def test_store_rejects_provider_switch_on_load(tmp_path) -> None:
-    path = tmp_path / "s"
-    store = LocalVectorStore(path, dim=4, embedding_id="hash:local")
-    store.upsert([_chunk("a", "text")], np.zeros((1, 4), np.float32))
-    store.save()
+def test_provider_switch_is_quarantined(tmp_path) -> None:
+    path = tmp_path / "index"
+    old = LocalVectorStore(path, dim=4, embedding_id="hash:local")
+    old.upsert([_chunk("a", "t")], np.zeros((1, 4), np.float32))
+    old.save()
 
-    import pytest
+    new = LocalVectorStore(path, dim=4, embedding_id="mistral:mistral-embed")
+    new.load()
+    assert new.count() == 0
+    assert "mistral:mistral-embed" in (new.quarantined_reason or "")
 
-    other = LocalVectorStore(path, dim=4, embedding_id="mistral:mistral-embed")
-    with pytest.raises(ValueError, match="mistral:mistral-embed"):
-        other.load()
 
-
-def test_store_rejects_inconsistent_index(tmp_path) -> None:
-    path = tmp_path / "s"
-    store = LocalVectorStore(path, dim=4)
-    store.upsert([_chunk("a", "text")], np.zeros((1, 4), np.float32))
-    store.save()
-
+def test_corrupt_index_is_quarantined(tmp_path) -> None:
     import json
 
-    import pytest
+    path = tmp_path / "index"
+    store = LocalVectorStore(path, dim=4)
+    store.upsert([_chunk("a", "t")], np.zeros((1, 4), np.float32))
+    store.save()
 
-    # simulate a torn write: two payloads, one vector
     payloads = json.loads((path / "payloads.json").read_text())
     payloads.append(dict(payloads[0], chunk_id="ghost"))
     (path / "payloads.json").write_text(json.dumps(payloads))
 
     broken = LocalVectorStore(path, dim=4)
-    with pytest.raises(ValueError, match="inconsistent"):
-        broken.load()
+    broken.load()
+    assert broken.count() == 0
+    assert "inconsistent" in (broken.quarantined_reason or "")

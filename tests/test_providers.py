@@ -11,6 +11,7 @@ import pytest
 from app.providers import (
     MistralEmbedder,
     MistralLLM,
+    ProviderError,
     _post_with_retry,
     build_embedder,
     build_llm,
@@ -181,9 +182,8 @@ def test_post_does_not_retry_on_400(monkeypatch: pytest.MonkeyPatch) -> None:
         return _FakeResponse({}, status=400)
 
     monkeypatch.setattr("httpx.post", fake_post)
-    import httpx
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(ProviderError):
         _post_with_retry("https://api.mistral.ai/v1/x", {}, {})
     assert len(attempts) == 1  # client error: fail fast, no retries
 
@@ -191,3 +191,54 @@ def test_post_does_not_retry_on_400(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_builders_wire_mistral() -> None:
     assert isinstance(build_embedder("mistral", "mistral-embed", 1024), MistralEmbedder)
     assert isinstance(build_llm("mistral", "mistral-large-latest"), MistralLLM)
+
+
+# --- actionable errors ----------------------------------------------------
+
+
+def test_expired_key_produces_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 401 must explain itself, not surface as a raw httpx traceback."""
+    monkeypatch.setenv("MISTRAL_API_KEY", "expired-key")
+
+    class Unauthorized(_FakeResponse):
+        def __init__(self) -> None:
+            super().__init__({"detail": "Your API key expired on 2026-11-21."}, status=401)
+
+    monkeypatch.setattr("httpx.post", lambda *a, **k: Unauthorized())
+    with pytest.raises(ProviderError) as info:
+        MistralEmbedder(dim=2).embed_query("x")
+
+    msg = str(info.value)
+    assert "401" in msg
+    assert "expired" in msg
+    assert "MISTRAL_API_KEY" in msg  # names the thing to fix
+    assert "console.mistral.ai" in msg  # says where
+
+
+def test_402_mentions_billing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "k")
+    monkeypatch.setattr("httpx.post", lambda *a, **k: _FakeResponse({}, status=402))
+    with pytest.raises(ProviderError, match="credit"):
+        MistralEmbedder(dim=2).embed_query("x")
+
+
+def test_404_points_at_model_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "k")
+    monkeypatch.setattr("httpx.post", lambda *a, **k: _FakeResponse({}, status=404))
+    with pytest.raises(ProviderError, match=r"RAG_(LLM|EMBEDDING)_MODEL"):
+        MistralLLM(model="nope").complete(system="s", user="u", max_tokens=8)
+
+
+def test_provider_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """401 must fail immediately; retrying a bad key just wastes time."""
+    monkeypatch.setenv("MISTRAL_API_KEY", "k")
+    calls: list[int] = []
+
+    def fake_post(*a, **k):
+        calls.append(1)
+        return _FakeResponse({}, status=401)
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    with pytest.raises(ProviderError):
+        MistralEmbedder(dim=2).embed_query("x")
+    assert len(calls) == 1

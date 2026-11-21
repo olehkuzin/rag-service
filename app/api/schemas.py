@@ -72,6 +72,7 @@ class IngestResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    warning: str | None = None
     chunks: int
     embedding_provider: str
     llm_provider: str
