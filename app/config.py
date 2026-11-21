@@ -18,18 +18,18 @@ class Settings(BaseSettings):
     # --- corpus / storage ---
     corpus_dir: Path = Path("data/corpus")
     index_dir: Path = Path("data/index")
-    vector_store: str = "local"  # local | qdrant
+    vector_store: str = "local"  # local (default) | qdrant (optional dep)
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "dbt_docs"
 
     # --- embeddings ---
-    embedding_provider: str = "hash"  # hash | voyage | openai
-    embedding_model: str = "voyage-3-lite"
+    embedding_provider: str = "hash"  # hash | mistral
+    embedding_model: str = "mistral-embed"
     embedding_dim: int = 512
 
     # --- LLM ---
-    llm_provider: str = "fake"  # fake | anthropic
-    llm_model: str = "claude-sonnet-4-20250514"
+    llm_provider: str = "fake"  # fake | mistral
+    llm_model: str = "mistral-large-latest"
     llm_max_tokens: int = 1024
 
     # --- retrieval ---

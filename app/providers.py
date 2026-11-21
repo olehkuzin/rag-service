@@ -12,7 +12,7 @@ import json
 import math
 import re
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -66,62 +66,54 @@ class HashEmbedder:
         return self._vector(text)
 
 
-class VoyageEmbedder:
-    """Voyage hosted embeddings (requires VOYAGE_API_KEY)."""
+class MistralEmbedder:
+    """Mistral hosted embeddings (requires MISTRAL_API_KEY).
 
-    def __init__(self, model: str = "voyage-3-lite", dim: int = 512) -> None:
+    `mistral-embed` returns 1024-dimensional vectors. The returned dimension is
+    validated against the configured one, because a silent mismatch would
+    corrupt the persisted vector index.
+    """
+
+    API_URL = "https://api.mistral.ai/v1/embeddings"
+    MAX_BATCH = 64
+
+    def __init__(self, model: str = "mistral-embed", dim: int = 1024) -> None:
         self.model = model
         self.dim = dim
 
     def embed_documents(self, texts: Sequence[str]) -> np.ndarray:
-        return self._call(texts, input_type="document")
-
-    def embed_query(self, text: str) -> np.ndarray:
-        vector: np.ndarray = self._call([text], input_type="query")[0]
-        return vector
-
-    def _call(self, texts: Sequence[str], input_type: str) -> np.ndarray:
-        import httpx
-
-        resp = httpx.post(
-            "https://api.voyageai.com/v1/embeddings",
-            headers={"Authorization": f"Bearer {_require_env('VOYAGE_API_KEY')}"},
-            json={"input": list(texts), "model": self.model, "input_type": input_type},
-            timeout=60.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()["data"]
-        vectors: np.ndarray = np.asarray([d["embedding"] for d in data], dtype=np.float32)
-        return vectors
-
-
-class OpenAIEmbedder:
-    """OpenAI hosted embeddings (requires OPENAI_API_KEY)."""
-
-    def __init__(self, model: str = "text-embedding-3-small", dim: int = 1536) -> None:
-        self.model = model
-        self.dim = dim
-
-    def embed_documents(self, texts: Sequence[str]) -> np.ndarray:
-        return self._call(texts)
+        if not texts:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        batches: list[np.ndarray] = []
+        for start in range(0, len(texts), self.MAX_BATCH):
+            batches.append(self._call(list(texts[start : start + self.MAX_BATCH])))
+        return np.vstack(batches)
 
     def embed_query(self, text: str) -> np.ndarray:
         vector: np.ndarray = self._call([text])[0]
         return vector
 
     def _call(self, texts: Sequence[str]) -> np.ndarray:
-        import httpx
-
-        resp = httpx.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={"Authorization": f"Bearer {_require_env('OPENAI_API_KEY')}"},
-            json={"input": list(texts), "model": self.model},
-            timeout=60.0,
+        resp = _post_with_retry(
+            self.API_URL,
+            headers={"Authorization": f"Bearer {_require_env('MISTRAL_API_KEY')}"},
+            json={"input": list(texts), "model": self.model, "encoding_format": "float"},
         )
-        resp.raise_for_status()
-        data = resp.json()["data"]
-        vectors: np.ndarray = np.asarray([d["embedding"] for d in data], dtype=np.float32)
-        return vectors
+        rows = sorted(resp.json()["data"], key=lambda d: d["index"])
+        vectors = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
+        if len(vectors) != len(texts):
+            raise RuntimeError(
+                f"Mistral returned {len(vectors)} embeddings for {len(texts)} inputs"
+            )
+        if vectors.shape[1] != self.dim:
+            raise ValueError(
+                f"embedding dim mismatch: {self.model} returned {vectors.shape[1]}, "
+                f"but RAG_EMBEDDING_DIM is {self.dim}. "
+                f"Set RAG_EMBEDDING_DIM={vectors.shape[1]} and re-ingest."
+            )
+        # L2-normalise so cosine similarity == dot product in the local store
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        return vectors / np.where(norms == 0, 1.0, norms)
 
 
 def _require_env(name: str) -> str:
@@ -133,14 +125,36 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _post_with_retry(url: str, headers: dict[str, str], json: dict[str, object]) -> Any:
+    """POST with retries on 429/5xx and transport errors (exponential backoff)."""
+    import httpx
+    from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
+    def _retryable(exc: BaseException) -> bool:
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code in {429, 500, 502, 503, 504}
+        return isinstance(exc, (httpx.TransportError, httpx.TimeoutException))
+
+    @retry(
+        retry=retry_if_exception(_retryable),
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=0.5, max=8),
+        reraise=True,
+    )
+    def _do() -> Any:
+        resp = httpx.post(url, headers=headers, json=json, timeout=60.0)
+        resp.raise_for_status()
+        return resp
+
+    return _do()
+
+
 def build_embedder(provider: str, model: str, dim: int) -> Embedder:
     match provider:
         case "hash":
             return HashEmbedder(dim=dim)
-        case "voyage":
-            return VoyageEmbedder(model=model, dim=dim)
-        case "openai":
-            return OpenAIEmbedder(model=model, dim=dim)
+        case "mistral":
+            return MistralEmbedder(model=model, dim=dim)
         case _:
             raise ValueError(f"unknown embedding provider: {provider}")
 
@@ -274,32 +288,48 @@ class FakeLLM:
         return answer, len(system + user) // 4, len(answer) // 4
 
 
-class AnthropicLLM:
-    """Anthropic Claude via the official SDK."""
+class MistralLLM:
+    """Mistral chat completions via REST (requires MISTRAL_API_KEY).
 
-    def __init__(self, model: str) -> None:
+    Uses `response_format=json_object` so strict-mode JSON parsing is reliable
+    rather than a best-effort retry.
+    """
+
+    API_URL = "https://api.mistral.ai/v1/chat/completions"
+
+    def __init__(self, model: str, temperature: float = 0.0) -> None:
         self.model = model
+        self.temperature = temperature
 
     def complete(self, *, system: str, user: str, max_tokens: int) -> tuple[str, int, int]:
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=_require_env("ANTHROPIC_API_KEY"))
-        msg = client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+        resp = _post_with_retry(
+            self.API_URL,
+            headers={
+                "Authorization": f"Bearer {_require_env('MISTRAL_API_KEY')}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "temperature": self.temperature,
+                "max_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
         )
-        text = "".join(block.text for block in msg.content if block.type == "text")
-        usage = msg.usage
-        return text, usage.input_tokens, usage.output_tokens
+        data = resp.json()
+        content = (data["choices"][0]["message"]["content"] or "").strip()
+        usage = data.get("usage") or {}
+        return content, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
 
 
 def build_llm(provider: str, model: str) -> LLMClient:
     match provider:
         case "fake":
             return FakeLLM()
-        case "anthropic":
-            return AnthropicLLM(model=model)
+        case "mistral":
+            return MistralLLM(model=model)
         case _:
             raise ValueError(f"unknown llm provider: {provider}")

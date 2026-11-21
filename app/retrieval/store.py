@@ -1,8 +1,9 @@
 """Vector store abstraction.
 
 `LocalVectorStore` persists embeddings + payloads to disk with numpy, so the
-service runs with no Docker or server. `QdrantVectorStore` is the production
-adapter; both satisfy `VectorStore`, so retrieval code is unchanged.
+service runs with no Docker or server — this is the default and the only store
+used in local deployments. `QdrantVectorStore` is an optional adapter (requires
+`qdrant-client`); both satisfy `VectorStore`, so retrieval code is unchanged.
 """
 
 from __future__ import annotations
@@ -37,9 +38,11 @@ class VectorStore(Protocol):
 class LocalVectorStore:
     """Numpy-backed cosine store with JSON metadata, persisted to a directory."""
 
-    def __init__(self, path: Path, dim: int) -> None:
+    def __init__(self, path: Path, dim: int, embedding_id: str = "") -> None:
         self.path = Path(path)
         self.dim = dim
+        # e.g. "mistral:mistral-embed" — lets load() detect a provider switch
+        self.embedding_id = embedding_id
         self._vectors: np.ndarray = np.zeros((0, dim), dtype=np.float32)
         self._payloads: list[dict[str, Any]] = []
 
@@ -47,15 +50,52 @@ class LocalVectorStore:
     def load(self) -> None:
         vec_file = self.path / "vectors.npy"
         meta_file = self.path / "payloads.json"
-        if vec_file.exists() and meta_file.exists():
-            self._vectors = np.load(vec_file)
-            self._payloads = json.loads(meta_file.read_text(encoding="utf-8"))
+        if not (vec_file.exists() and meta_file.exists()):
+            return
+        # Validate before assigning: a dim mismatch (e.g. switching the embedding
+        # provider without re-ingesting) must fail loudly, not corrupt retrieval.
+        vectors = np.load(vec_file)
+        if vectors.ndim != 2 or vectors.shape[1] != self.dim:
+            raise ValueError(
+                f"persisted index at {self.path} has dimension "
+                f"{vectors.shape[1] if vectors.ndim == 2 else 'unknown'}, "
+                f"but the configured embedding dimension is {self.dim}. "
+                "Re-ingest with --force after changing embedding providers."
+            )
+        manifest_file = self.path / "index_meta.json"
+        if manifest_file.exists() and self.embedding_id:
+            meta = json.loads(manifest_file.read_text(encoding="utf-8"))
+            stored = meta.get("embedding_id")
+            if stored and stored != self.embedding_id:
+                raise ValueError(
+                    f"index was built with {stored!r} but configured embedding is "
+                    f"{self.embedding_id!r}. Re-ingest with --force."
+                )
+
+        self._vectors = vectors
+        self._payloads = json.loads(meta_file.read_text(encoding="utf-8"))
+        if len(self._payloads) != len(self._vectors):
+            raise ValueError(
+                f"index is inconsistent: {len(self._vectors)} vectors vs "
+                f"{len(self._payloads)} payloads. Re-ingest with --force."
+            )
 
     def save(self) -> None:
         self.path.mkdir(parents=True, exist_ok=True)
         np.save(self.path / "vectors.npy", self._vectors)
         (self.path / "payloads.json").write_text(
             json.dumps(self._payloads, ensure_ascii=False), encoding="utf-8"
+        )
+        (self.path / "index_meta.json").write_text(
+            json.dumps(
+                {
+                    "embedding_id": self.embedding_id,
+                    "dim": self.dim,
+                    "count": len(self._payloads),
+                },
+                indent=1,
+            ),
+            encoding="utf-8",
         )
 
     # -- writes ------------------------------------------------------------
@@ -152,7 +192,14 @@ class QdrantVectorStore:
         self.dim = dim
 
     def _client(self) -> Any:
-        from qdrant_client import QdrantClient
+        try:
+            from qdrant_client import QdrantClient
+        except ImportError as exc:  # optional dependency, not installed by default
+            raise RuntimeError(
+                "RAG_VECTOR_STORE=qdrant requires the optional dependency: "
+                "`uv pip install qdrant-client`, and a running Qdrant instance "
+                f"at {self.url}. The default local numpy store needs neither."
+            ) from exc
 
         client = QdrantClient(url=self.url)
         if not client.collection_exists(self.collection):

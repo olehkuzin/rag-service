@@ -10,7 +10,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 RUN pip install --upgrade pip && \
     pip install fastapi "uvicorn[standard]" pydantic pydantic-settings numpy \
-    python-frontmatter PyYAML httpx anthropic tenacity
+    python-frontmatter PyYAML httpx tenacity
 
 # --- source ---
 COPY app ./app

@@ -95,3 +95,14 @@ def test_incremental_ingest_via_api(client: TestClient) -> None:
     second = client.post("/ingest", json={"force": False}).json()
     assert first["docs_changed"] == first["docs_seen"] - first["docs_empty"]
     assert second["docs_skipped"] == second["docs_seen"] - second["docs_empty"]
+
+
+def test_prompt_variant_override_does_not_leak_between_requests(client: TestClient) -> None:
+    """Per-request overrides must not mutate the shared service singleton."""
+    client.post("/ingest", json={"force": True})
+    first = client.post("/ask", json={"question": "models", "prompt_variant": "basic"})
+    assert first.json()["prompt_variant"] == "basic"
+
+    # a request without the override must fall back to the configured default
+    second = client.post("/ask", json={"question": "models"})
+    assert second.json()["prompt_variant"] == "strict"

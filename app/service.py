@@ -57,7 +57,11 @@ class Service:
                 collection=self.settings.qdrant_collection,
                 dim=self.settings.embedding_dim,
             )
-        store = LocalVectorStore(self.settings.index_dir, self.settings.embedding_dim)
+        store = LocalVectorStore(
+            self.settings.index_dir,
+            self.settings.embedding_dim,
+            embedding_id=f"{self.settings.embedding_provider}:{self.settings.embedding_model}",
+        )
         store.load()
         return store
 

@@ -143,3 +143,50 @@ def test_retriever_doc_filter(service: Service) -> None:
         doc_ids=doc_ids,
     )
     assert all(c.chunk.doc_id in doc_ids for c in result.chunks)
+
+
+def test_store_rejects_dim_mismatch_on_load(tmp_path) -> None:
+    """Switching embedding providers without re-ingesting must fail loudly."""
+    path = tmp_path / "s"
+    store = LocalVectorStore(path, dim=8)
+    store.upsert([_chunk("a", "text")], np.zeros((1, 8), np.float32))
+    store.save()
+
+    import pytest
+
+    wrong = LocalVectorStore(path, dim=4)
+    with pytest.raises(ValueError, match="dimension"):
+        wrong.load()
+
+
+def test_store_rejects_provider_switch_on_load(tmp_path) -> None:
+    path = tmp_path / "s"
+    store = LocalVectorStore(path, dim=4, embedding_id="hash:local")
+    store.upsert([_chunk("a", "text")], np.zeros((1, 4), np.float32))
+    store.save()
+
+    import pytest
+
+    other = LocalVectorStore(path, dim=4, embedding_id="mistral:mistral-embed")
+    with pytest.raises(ValueError, match="mistral:mistral-embed"):
+        other.load()
+
+
+def test_store_rejects_inconsistent_index(tmp_path) -> None:
+    path = tmp_path / "s"
+    store = LocalVectorStore(path, dim=4)
+    store.upsert([_chunk("a", "text")], np.zeros((1, 4), np.float32))
+    store.save()
+
+    import json
+
+    import pytest
+
+    # simulate a torn write: two payloads, one vector
+    payloads = json.loads((path / "payloads.json").read_text())
+    payloads.append(dict(payloads[0], chunk_id="ghost"))
+    (path / "payloads.json").write_text(json.dumps(payloads))
+
+    broken = LocalVectorStore(path, dim=4)
+    with pytest.raises(ValueError, match="inconsistent"):
+        broken.load()

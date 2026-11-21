@@ -1,4 +1,4 @@
-.PHONY: install corpus lint format typecheck test eval up down ingest ask clean
+.PHONY: install corpus lint format typecheck test eval eval-mistral up down ingest ask clean
 
 install:
 	uv venv --python 3.12 .venv
@@ -21,6 +21,12 @@ test:
 
 eval:
 	.venv/bin/python -m eval.run_eval
+
+# real-provider evaluation (needs MISTRAL_API_KEY); rebuilds the index because
+# mistral-embed is 1024-dim vs the offline hash embedder's 512
+eval-mistral:
+	rm -rf data/eval_index
+	.venv/bin/python -m eval.run_eval --llm mistral --embedder mistral
 
 ingest:
 	.venv/bin/python -m scripts.ingest_cli ingest

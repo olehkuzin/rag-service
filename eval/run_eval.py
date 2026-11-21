@@ -307,7 +307,7 @@ class VariantReport:
 
 def _build_service(settings: Settings, variant: Variant, workdir: Path) -> Service:
     """Fresh service + index per chunking strategy (cache by strategy)."""
-    index_dir = workdir / f"index_{variant.chunk_strategy}"
+    index_dir = workdir / f"index_{variant.chunk_strategy}_{settings.embedding_provider}"
     variant_settings = settings.model_copy(
         update={
             "index_dir": index_dir,
@@ -503,6 +503,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--corpus", default="data/corpus")
     parser.add_argument("--workdir", default="data/eval_index")
     parser.add_argument("--out", default=None, help="report output dir")
+    parser.add_argument(
+        "--llm",
+        default="fake",
+        choices=["fake", "mistral"],
+        help="LLM provider for generation metrics (mistral needs MISTRAL_API_KEY)",
+    )
+    parser.add_argument(
+        "--embedder",
+        default="hash",
+        choices=["hash", "mistral"],
+        help="embedding provider (mistral uses RAG_EMBEDDING_DIM, default 1024)",
+    )
+    parser.add_argument(
+        "--embedding-dim", type=int, default=None, help="override embedding dimension"
+    )
     args = parser.parse_args(argv)
 
     questions = load_dataset(limit=args.limit)
@@ -514,7 +529,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no matching variants; available: {[v.name for v in DEFAULT_VARIANTS]}")
             return 2
 
-    base_settings = Settings(corpus_dir=Path(args.corpus), llm_provider="fake")
+    overrides: dict[str, object] = {
+        "corpus_dir": Path(args.corpus),
+        "llm_provider": args.llm,
+        "embedding_provider": args.embedder,
+    }
+    if args.embedding_dim is not None:
+        overrides["embedding_dim"] = args.embedding_dim
+    elif args.embedder == "mistral":
+        overrides["embedding_dim"] = 1024
+    base_settings = Settings(**overrides)  # type: ignore[arg-type]
     workdir = Path(args.workdir)
     reports: list[VariantReport] = []
     services: dict[str, Service] = {}

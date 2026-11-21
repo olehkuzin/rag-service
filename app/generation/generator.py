@@ -92,8 +92,16 @@ def parse_response(
     if fence:
         text = fence.group(1).strip()
 
+    # Tolerate minor wrapping noise from real models (Mistral json_object mode is
+    # clean, but prose preambles and trailing text still happen).
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            text = text[start : end + 1]
+
     data: dict[str, Any] | None = None
-    if text.startswith("{") or fence:
+    if text.startswith("{"):
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
@@ -122,6 +130,24 @@ def parse_response(
     confidence = _clamp(data.get("confidence", 0.0))
     cited_ids = [str(c) for c in data.get("citations") or []]
 
+    if not answer:
+        found = False  # an empty answer is an abstention, regardless of `found`
+
+    # strict mode: an answer with no resolvable citation is not trustworthy
+    if variant == "strict" and found and not _resolvable(cited_ids, lookup):
+        return (
+            GenerationResult(
+                answer=answer,
+                found=False,
+                citations=[],
+                confidence=0.0,
+                raw=raw,
+                prompt_variant=variant,
+                parse_error="citation_missing",
+            ),
+            "citation_missing",
+        )
+
     citations: list[Citation] = []
     for key in cited_ids:
         scored = lookup.get(key)
@@ -137,24 +163,6 @@ def parse_response(
             )
         )
 
-    # strict mode: an answer with no resolvable citation is not trustworthy
-    if variant == "strict" and found and not citations:
-        return (
-            GenerationResult(
-                answer=answer,
-                found=False,
-                citations=[],
-                confidence=0.0,
-                raw=raw,
-                prompt_variant=variant,
-                parse_error="citation_missing",
-            ),
-            "citation_missing",
-        )
-
-    if not answer and found:
-        found = False
-
     return (
         GenerationResult(
             answer=answer,
@@ -166,6 +174,10 @@ def parse_response(
         ),
         None,
     )
+
+
+def _resolvable(cited_ids: list[str], lookup: dict[str, ScoredChunk]) -> bool:
+    return any(key in lookup for key in cited_ids)
 
 
 def _clamp(value: object) -> float:

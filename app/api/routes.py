@@ -35,7 +35,7 @@ async def ask(request: AskRequest) -> AskResponse:
         raise HTTPException(status_code=503, detail="index is empty; run POST /ingest first")
 
     config = None
-    if request.hybrid is not None or request.rerank is not None or request.prompt_variant:
+    if request.hybrid is not None or request.rerank is not None:
         from app.retrieval.pipeline import RetrievalConfig
 
         config = RetrievalConfig.from_settings(service.settings, request.top_k)
@@ -43,12 +43,15 @@ async def ask(request: AskRequest) -> AskResponse:
             config.enable_hybrid = request.hybrid
         if request.rerank is not None:
             config.enable_rerank = request.rerank
-        if request.prompt_variant:
-            service.generator.settings = service.settings.model_copy(
-                update={"prompt_variant": request.prompt_variant}
-            )
+
     try:
-        result, trace = service.ask(request.question, top_k=request.top_k, config=config)
+        result, trace = service.ask(
+            request.question,
+            top_k=request.top_k,
+            config=config,
+            # pass the variant per call; never mutate shared singleton state
+            prompt_variant=request.prompt_variant,
+        )
     except Exception as exc:  # surface provider failures as 502, not 500 traces
         raise HTTPException(status_code=502, detail=f"generation failed: {exc}") from exc
 

@@ -18,8 +18,11 @@ from typing import Any
 
 # approximate USD per 1M tokens; override as models change
 PRICING = {
-    "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
-    "claude-haiku-4-20250514": {"input": 0.8, "output": 4.0},
+    # USD per 1M tokens; approximate Mistral public list prices. Override as needed.
+    "mistral-large-latest": {"input": 2.0, "output": 6.0},
+    "mistral-medium-latest": {"input": 0.4, "output": 2.0},
+    "mistral-small-latest": {"input": 0.1, "output": 0.3},
+    "open-mistral-nemo": {"input": 0.15, "output": 0.15},
 }
 
 
