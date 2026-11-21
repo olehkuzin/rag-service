@@ -17,8 +17,11 @@ COPY app ./app
 COPY scripts ./scripts
 COPY eval ./eval
 
-# run as a non-root user
-RUN useradd --create-home --uid 1000 appuser && chown -R appuser /app
+# run as a non-root user. The data dirs must exist in the image, owned by that
+# user: a named volume mounted on a missing path is created root-owned, and the
+# app could then not write its index or traces.
+RUN mkdir -p /app/data/index /app/data/corpus && \
+    useradd --create-home --uid 1000 appuser && chown -R appuser /app
 USER appuser
 
 EXPOSE 8000

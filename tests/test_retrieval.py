@@ -201,3 +201,90 @@ def test_corrupt_index_is_quarantined(tmp_path) -> None:
     broken.load()
     assert broken.count() == 0
     assert "inconsistent" in (broken.quarantined_reason or "")
+
+
+def test_replace_docs_swaps_one_doc_and_leaves_others(tmp_path) -> None:
+    store = LocalVectorStore(tmp_path / "s", dim=2)
+    store.upsert(
+        [
+            _chunk("a1", "old a", doc="a"),
+            _chunk("a2", "old a2", doc="a"),
+            _chunk("b1", "b", doc="b"),
+        ],
+        np.array([[1.0, 0], [1.0, 0], [0, 1.0]], np.float32),
+    )
+    new_vec = np.array([[0.6, 0.8]], np.float32)
+    written = store.replace_docs(["a"], [_chunk("a3", "new a", doc="a")], new_vec)
+    assert written == 1
+    assert sorted(c.chunk_id for c in store.all_chunks()) == ["a3", "b1"]
+    hit = store.search(np.array([0.6, 0.8], np.float32), top_k=1)[0]
+    assert hit.chunk_id == "a3" and hit.chunk.text == "new a"
+
+
+def test_upsert_with_duplicate_ids_in_one_batch_keeps_the_last(tmp_path) -> None:
+    store = LocalVectorStore(tmp_path / "s", dim=2)
+    store.upsert(
+        [_chunk("x", "first"), _chunk("x", "second")], np.array([[1.0, 0], [0, 1.0]], np.float32)
+    )
+    assert store.count() == 1
+    hit = store.search(np.array([0, 1.0], np.float32), top_k=1)[0]
+    assert hit.chunk.text == "second" and abs(hit.score - 1.0) < 1e-6
+
+
+def test_concurrent_reads_during_writes_never_fail(tmp_path) -> None:
+    """Regression: /ask during /ingest could IndexError or pair a vector with the wrong payload."""
+    import threading
+
+    dim = 8
+    store = LocalVectorStore(tmp_path / "s", dim=dim)
+    bm25 = BM25Index()
+    rng = np.random.default_rng(0)
+
+    def batch(prefix: str, n: int) -> tuple[list[Chunk], np.ndarray]:
+        chunks = [
+            _chunk(f"{prefix}-{i}", f"incremental model {prefix} {i}", doc=prefix) for i in range(n)
+        ]
+        vecs = rng.normal(size=(n, dim)).astype(np.float32)
+        return chunks, vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+
+    store.upsert(*batch("seed", 20))
+    bm25.build(store.all_chunks())
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def reader() -> None:
+        q = np.ones(dim, np.float32) / np.sqrt(dim)
+        while not stop.is_set():
+            try:
+                for hit in store.search(q, top_k=5):
+                    # the payload must belong to the row that was scored
+                    assert hit.chunk.chunk_id.split("-")[0] == hit.chunk.doc_id
+                bm25.search("incremental model", 5)
+                store.count()
+            except BaseException as exc:  # pragma: no cover - only on regression
+                errors.append(exc)
+                return
+
+    import sys
+
+    readers = [threading.Thread(target=reader) for _ in range(3)]
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads constantly to provoke interleavings
+    for t in readers:
+        t.start()
+    try:
+        for i in range(50):
+            doc = f"d{i % 5}"
+            if i % 3 == 0:
+                store.upsert(*batch(doc, 1 + i % 7))
+            elif i % 3 == 1:
+                store.replace_docs([doc], *batch(doc, 1 + i % 4))
+            else:
+                store.delete_docs([doc])
+            bm25.build(store.all_chunks())
+    finally:
+        stop.set()
+        for t in readers:
+            t.join()
+        sys.setswitchinterval(old_interval)
+    assert not errors, errors[0]

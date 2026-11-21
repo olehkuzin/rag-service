@@ -256,3 +256,30 @@ def test_eval_question_defaults() -> None:
         answerable=True,
     )
     assert q.answerable is True
+
+
+def test_eval_settings_ignore_env_embedding_dim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: the hash embedder inherited RAG_EMBEDDING_DIM=1024 from a Mistral .env."""
+    from eval.run_eval import eval_settings
+
+    monkeypatch.setenv("RAG_EMBEDDING_DIM", "1024")
+    corpus = Path("data/corpus")
+    assert eval_settings(corpus, "fake", "hash").embedding_dim == 512
+    assert eval_settings(corpus, "fake", "mistral").embedding_dim == 1024
+    assert eval_settings(corpus, "fake", "hash", embedding_dim=256).embedding_dim == 256
+
+
+def test_eval_index_dir_changes_with_vector_affecting_settings(tmp_path: Path) -> None:
+    from eval.run_eval import eval_settings, index_dir_for
+
+    base = eval_settings(Path("c"), "fake", "hash")
+    variants = [
+        base,
+        base.model_copy(update={"embedding_dim": 256}),
+        base.model_copy(update={"chunk_max_chars": 900}),
+        base.model_copy(update={"embedding_provider": "mistral"}),
+    ]
+    dirs = {index_dir_for(s, "structure", tmp_path) for s in variants}
+    assert len(dirs) == len(variants)
+    assert index_dir_for(base, "structure", tmp_path) == index_dir_for(base, "structure", tmp_path)
+    assert index_dir_for(base, "fixed", tmp_path) != index_dir_for(base, "structure", tmp_path)

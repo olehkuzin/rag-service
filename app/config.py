@@ -54,7 +54,8 @@ class Settings(BaseSettings):
     # --- LLM ---
     llm_provider: str = "fake"  # fake | mistral
     llm_model: str = "mistral-large-latest"
-    llm_max_tokens: int = 1024
+    # reasoning models count thinking tokens against this budget, so keep it generous
+    llm_max_tokens: int = 4096
 
     # --- retrieval ---
     chunk_max_chars: int = 1800

@@ -346,6 +346,9 @@ class MistralLLM:
             json={
                 "model": self.model,
                 "temperature": self.temperature,
+                # Mistral rejects greedy decoding (temperature 0) unless top_p is exactly 1,
+                # and the model default is not 1
+                "top_p": 1.0,
                 "max_tokens": max_tokens,
                 "response_format": {"type": "json_object"},
                 "messages": [
@@ -355,9 +358,36 @@ class MistralLLM:
             },
         )
         data = resp.json()
-        content = (data["choices"][0]["message"]["content"] or "").strip()
+        choice = data["choices"][0]
+        content = _message_text(choice["message"]["content"]).strip()
         usage = data.get("usage") or {}
+        if not content and choice.get("finish_reason") == "length":
+            # reasoning models (mistral-large-latest is one) spend max_tokens on
+            # thinking first; an empty, truncated reply is a config error, not an abstention
+            raise ProviderError(
+                f"{self.model} hit max_tokens={max_tokens} before producing an answer "
+                f"({usage.get('completion_tokens', '?')} completion tokens, mostly reasoning).\n"
+                "  Raise RAG_LLM_MAX_TOKENS (4096 is the default)."
+            )
         return content, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
+
+
+def _message_text(content: Any) -> str:
+    """Chat message content as text.
+
+    Mistral returns either a plain string or a list of typed chunks
+    (`{"type": "text", "text": ...}`, plus e.g. thinking/reference chunks). Only
+    text chunks are the answer; anything else would corrupt the JSON payload.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    return "".join(
+        str(chunk.get("text", ""))
+        for chunk in content
+        if isinstance(chunk, dict) and chunk.get("type") == "text"
+    )
 
 
 def build_llm(provider: str, model: str) -> LLMClient:

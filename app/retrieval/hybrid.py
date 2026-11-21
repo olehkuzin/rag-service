@@ -65,59 +65,76 @@ def tokenize(text: str) -> list[str]:
     return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS]
 
 
+@dataclass(frozen=True, slots=True)
+class _BM25State:
+    """Everything a search needs, built once and never mutated after publishing."""
+
+    chunks: tuple[Chunk, ...] = ()
+    tfs: tuple[Counter[str], ...] = ()
+    lengths: tuple[int, ...] = ()
+    df: Counter[str] = field(default_factory=Counter)
+    avgdl: float = 0.0
+
+
 @dataclass
 class BM25Index:
-    """In-memory Okapi BM25 over the chunk corpus. Rebuilt after ingestion."""
+    """In-memory Okapi BM25 over the chunk corpus. Rebuilt after ingestion.
+
+    `build` computes a new `_BM25State` off to the side and publishes it with one
+    assignment, so a concurrent `search` always sees a complete, consistent index.
+    """
 
     k1: float = 1.5
     b: float = 0.75
-    _chunks: list[Chunk] = field(default_factory=list)
-    _tfs: list[Counter[str]] = field(default_factory=list)
-    _lengths: list[int] = field(default_factory=list)
-    _df: Counter[str] = field(default_factory=Counter)
-    _avgdl: float = 0.0
+    _state: _BM25State = field(default_factory=_BM25State)
 
     def build(self, chunks: Sequence[Chunk]) -> None:
-        self._chunks = list(chunks)
-        self._tfs = []
-        self._lengths = []
-        self._df = Counter()
-        for chunk in self._chunks:
+        tfs: list[Counter[str]] = []
+        lengths: list[int] = []
+        df: Counter[str] = Counter()
+        for chunk in chunks:
             tokens = tokenize(f"{chunk.title} {chunk.section} {chunk.text}")
             tf = Counter(tokens)
-            self._tfs.append(tf)
-            self._lengths.append(len(tokens))
-            for term in tf:
-                self._df[term] += 1
-        self._avgdl = sum(self._lengths) / len(self._lengths) if self._lengths else 0.0
+            tfs.append(tf)
+            lengths.append(len(tokens))
+            df.update(tf.keys())
+        self._state = _BM25State(
+            chunks=tuple(chunks),
+            tfs=tuple(tfs),
+            lengths=tuple(lengths),
+            df=df,
+            avgdl=sum(lengths) / len(lengths) if lengths else 0.0,
+        )
 
-    def _idf(self, term: str) -> float:
-        n = len(self._chunks)
-        df = self._df.get(term, 0)
+    @staticmethod
+    def _idf(state: _BM25State, term: str) -> float:
+        n = len(state.chunks)
+        df = state.df.get(term, 0)
         return math.log(1 + (n - df + 0.5) / (df + 0.5))
 
     def search(self, query: str, top_k: int) -> list[ScoredChunk]:
-        if not self._chunks:
+        state = self._state  # one consistent view for the whole search
+        if not state.chunks:
             return []
         q_terms = tokenize(query)
         if not q_terms:
             return []
 
+        idf = {term: self._idf(state, term) for term in set(q_terms)}
         scores = []
-        for i, tf in enumerate(self._tfs):
-            length = self._lengths[i]
-            denom_norm = self.k1 * (1 - self.b + self.b * length / (self._avgdl or 1.0))
+        for tf, length in zip(state.tfs, state.lengths, strict=True):
+            denom_norm = self.k1 * (1 - self.b + self.b * length / (state.avgdl or 1.0))
             score = 0.0
             for term in q_terms:
                 f = tf.get(term, 0)
                 if f:
-                    score += self._idf(term) * (f * (self.k1 + 1)) / (f + denom_norm)
+                    score += idf[term] * (f * (self.k1 + 1)) / (f + denom_norm)
             scores.append(score)
 
         ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
         return [
             ScoredChunk(
-                chunk=self._chunks[i],
+                chunk=state.chunks[i],
                 score=scores[i],
                 bm25_score=scores[i],
                 rank=rank + 1,
@@ -127,7 +144,7 @@ class BM25Index:
         ]
 
     def __len__(self) -> int:
-        return len(self._chunks)
+        return len(self._state.chunks)
 
 
 def reciprocal_rank_fusion(

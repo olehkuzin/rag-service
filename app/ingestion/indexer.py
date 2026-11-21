@@ -1,8 +1,14 @@
 """Incremental ingestion pipeline: discover -> parse -> chunk -> QC -> embed -> upsert.
 
 Incremental by content hash: a document is re-processed only when its cleaned
-text changes. Changed docs have their old chunks removed first so deleted
-sections do not linger in the index.
+text changes. Changed docs have their old chunks replaced so deleted sections do
+not linger in the index.
+
+A run is all-or-nothing: every changed document is parsed, chunked, checked and
+embedded first, and only then are the changes applied to the store in one
+`replace_docs` call. If a provider fails mid-run (401, exhausted retries), the
+store and manifest are exactly as before and the next run simply retries; the
+trade-off is that embeddings computed before the failure are not kept.
 """
 
 from __future__ import annotations
@@ -10,6 +16,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 from app.config import Settings
 from app.ingestion.chunker import chunk_document
@@ -87,6 +96,10 @@ class Ingestor:
         existing = {} if force else self.manifest.hashes()
 
         seen_doc_ids: set[str] = set()
+        replace_ids: list[str] = []
+        staged_chunks: list[Chunk] = []
+        staged_vectors: list[np.ndarray] = []
+        records: list[dict[str, Any]] = []
         for path in files:
             try:
                 doc = parse_file(path, self.corpus_dir)
@@ -106,8 +119,7 @@ class Ingestor:
                 continue
 
             stats.docs_changed += 1
-            # remove the old version's chunks before writing the new ones
-            self.store.delete_docs([doc.doc_id])
+            replace_ids.append(doc.doc_id)  # the old version's chunks are replaced on commit
 
             raw_chunks: list[Chunk] = chunk_document(doc, self.settings)
             stats.chunks_created += len(raw_chunks)
@@ -115,40 +127,56 @@ class Ingestor:
             _merge_report(report, partial)
             stats.chunks_dropped += len(raw_chunks) - len(kept)
 
-            written = self._embed_and_store(kept) if kept else 0
-            stats.chunks_written += written
-            stats.vectors_embedded += written
+            if kept:
+                staged_vectors.append(self._embed(kept))
+                staged_chunks.extend(kept)
 
             # record even when chunk_count == 0, so the doc converges
-            self.manifest.record(
-                doc_id=doc.doc_id,
-                rel_path=doc.rel_path,
-                content_hash=doc.content_hash,
-                chunk_count=written,
-                words=int(doc.metadata.get("word_count", 0)),
+            records.append(
+                {
+                    "doc_id": doc.doc_id,
+                    "rel_path": doc.rel_path,
+                    "content_hash": doc.content_hash,
+                    "chunk_count": len(kept),
+                    "words": int(doc.metadata.get("word_count", 0)),
+                }
             )
 
-        # prune manifest entries whose files disappeared from the corpus
-        if limit is None:
-            for doc_id in set(self.manifest.docs) - seen_doc_ids:
-                self.manifest.forget(doc_id)
-                self.store.delete_docs([doc_id])
-                stats.docs_removed += 1
+        # prune documents whose files disappeared from the corpus
+        removed = sorted(set(self.manifest.docs) - seen_doc_ids) if limit is None else []
+        stats.docs_removed = len(removed)
 
-        self.manifest.save()
+        # --- commit: only reached when every embedding call succeeded ---
+        if replace_ids or removed:
+            vectors = (
+                np.vstack(staged_vectors)
+                if staged_vectors
+                else np.zeros((0, self.embedder.dim), dtype=np.float32)
+            )
+            stats.chunks_written = self.store.replace_docs(
+                [*replace_ids, *removed], staged_chunks, vectors
+            )
+            stats.vectors_embedded = len(staged_chunks)
+        for record in records:
+            self.manifest.record(**record)
+        for doc_id in removed:
+            self.manifest.forget(doc_id)
+
+        # store before manifest: a crash in between re-processes docs (harmless)
+        # instead of recording docs as indexed that the store never received
         if hasattr(self.store, "save"):
             self.store.save()
+        self.manifest.save()
         stats.quality = report
         stats.latency_ms = (time.perf_counter() - started) * 1000
         return stats
 
-    def _embed_and_store(self, chunks: list[Chunk]) -> int:
-        written = 0
-        for start in range(0, len(chunks), EMBED_BATCH):
-            batch = chunks[start : start + EMBED_BATCH]
-            vectors = self.embedder.embed_documents([c.text for c in batch])
-            written += self.store.upsert(batch, vectors)
-        return written
+    def _embed(self, chunks: list[Chunk]) -> np.ndarray:
+        batches = [
+            self.embedder.embed_documents([c.text for c in chunks[start : start + EMBED_BATCH]])
+            for start in range(0, len(chunks), EMBED_BATCH)
+        ]
+        return np.vstack(batches)
 
 
 def _merge_report(agg: QualityReport, part: QualityReport) -> None:

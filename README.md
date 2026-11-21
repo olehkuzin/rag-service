@@ -84,12 +84,20 @@ Or with Docker Compose (no Qdrant needed — the local store is the default):
 docker compose up --build
 ```
 
+The compose index volume starts empty, so `/ask` returns 503 until the first
+ingestion. Run `make corpus` beforehand (compose mounts `data/corpus`), set
+`MISTRAL_API_KEY` in `.env`, then index once:
+
+```bash
+curl -X POST localhost:8000/ingest
+```
+
 ```bash
 make install          # uv venv + editable install
 make corpus           # fetch the dbt docs into data/corpus (gitignored)
 make ingest           # parse → chunk → QC → embed → upsert
 make ask              # interactive question
-make test             # 44 tests
+make test             # 113 tests
 make eval             # run all evaluation variants
 .venv/bin/uvicorn app.main:app --reload
 ```
@@ -106,6 +114,13 @@ MISTRAL_API_KEY=...
 RAG_EMBEDDING_PROVIDER=mistral   RAG_EMBEDDING_MODEL=mistral-embed   RAG_EMBEDDING_DIM=1024
 RAG_LLM_PROVIDER=mistral         RAG_LLM_MODEL=mistral-large-latest
 ```
+
+`mistral-large-latest` currently resolves to `mistral-large-4`, a reasoning
+model: it emits thinking before the answer, and those tokens count against
+`RAG_LLM_MAX_TOKENS` (default 4096). With too small a budget it can run out
+before answering; that is reported as a provider error, not as an abstention.
+Requests pin `temperature=0, top_p=1` (Mistral rejects greedy decoding with any
+other `top_p`).
 
 Then rebuild the index — **the dimension changes from 512 to 1024**, so the old
 index must be discarded:
@@ -164,7 +179,10 @@ POST /ask
 
 Incremental ingestion converges: the first run over the full corpus indexes 9,344
 chunks from 1,198 documents in ~2.9s, and every subsequent run processes 0
-documents. A persisted manifest records each document version independently of
+documents. A run is all-or-nothing: changed documents are embedded first and
+applied to the store in one swap, so a provider failure mid-run (an expired key,
+exhausted retries) leaves the index exactly as it was, and queries served during
+ingestion always see a consistent index. A persisted manifest records each document version independently of
 its chunks, so documents that yield zero valid chunks are not reprocessed on
 every run, and documents deleted from the corpus are pruned from the index.
 
@@ -187,20 +205,20 @@ Reproduce with `make eval` (writes `eval/reports/latest.{json,md}`).
 
 ### Results (k=5, 1,208-doc corpus)
 
-| variant      | recall@k |  hit@k |    MRR | nDCG@k |    F1 | kw cov | cite acc | answer rate | abstain | p95 ms | cost/q |
-|--------------|---------:|-------:|-------:|-------:|------:|-------:|---------:|------------:|--------:|-------:|-------:|
-| baseline     |    0.286 |  0.357 |  0.226 |  0.309 | 0.074 |  0.208 |    0.143 |       1.000 |   0.000 |    0.5 | n/a |
-| +chunking    |    0.357 |  0.429 |  0.234 |  0.338 | 0.134 |  0.196 |    0.143 |       1.000 |   0.000 |    0.5 | n/a |
-| +hybrid      |    0.536 |  0.571 |  0.404 |  0.513 | 0.128 |  0.268 |    0.357 |       1.000 |   0.000 |    9.9 | n/a |
-| +rerank      |    0.536 |  0.571 |  0.348 |  0.498 | 0.107 |  0.325 |    0.214 |       1.000 |   0.000 |   10.7 | n/a |
-| strict       |    0.536 |  0.571 |  0.348 |  0.498 | 0.107 |  0.325 |    0.214 |       1.000 |   0.200 |   10.5 | n/a |
+| variant      |   recall@k |      hit@k |        MRR |     nDCG@k |         F1 |     kw cov |   cite acc | answer rate |    abstain |     p95 ms |     cost/q |
+|--------------|------------|------------|------------|------------|------------|------------|------------|------------|------------|------------|------------|
+| baseline     |      0.286 |      0.357 |      0.226 |      0.309 |      0.076 |      0.208 |      0.143 |      1.000 |      0.000 |        0.3 |        n/a |
+| +chunking    |      0.357 |      0.429 |      0.234 |      0.338 |      0.134 |      0.196 |      0.143 |      1.000 |      0.000 |        0.6 |        n/a |
+| +hybrid      |      0.536 |      0.571 |      0.404 |      0.513 |      0.128 |      0.268 |      0.357 |      1.000 |      0.000 |        8.8 |        n/a |
+| +rerank      |      0.536 |      0.571 |      0.348 |      0.498 |      0.107 |      0.325 |      0.214 |      1.000 |      0.000 |       10.3 |        n/a |
+| strict       |      0.536 |      0.571 |      0.348 |      0.498 |      0.107 |      0.325 |      0.214 |      1.000 |      0.000 |        9.8 |        n/a |
 
 Cost shows `n/a` under the offline stub: its token counts are synthetic, so
 pricing them produced a fabricated figure. Real costs appear with `--llm mistral`.
 
 Each row adds one stage to the row above. Headline: **recall@5 0.286 → 0.536
 (+87%)** and **hit@5 0.357 → 0.571** from structure-aware chunking + hybrid
-retrieval + reranking.
+retrieval. Reranking adds no recall on top of that (see below).
 
 ### Honest reading of these numbers
 
@@ -215,35 +233,44 @@ so reporting a dollar figure would be invented.
 - The default `hash` embedder is a token-hash bag-of-words, **not a semantic
   model**. Recall numbers are therefore a conservative lower bound; a hosted
   embedder should lift every retrieval row.
-- Abstention is 0.2 because the stub abstains only when no context is retrieved.
-  The harness *does* verify abstention plumbing (strict mode, unanswerable
-  questions) and would improve with a real model.
+- Abstention on unanswerable questions is 0.0: the stub answers whenever any
+  context is retrieved, and retrieval always returns something. (An earlier 0.2
+  here was a parser bug, not abstention: a JSON answer containing a ```` ```sql ````
+  block was mis-parsed and counted as abstaining.) The harness verifies the
+  abstention plumbing; measuring abstention itself needs a real model.
 - The dataset is 19 questions — enough to exercise every metric and catch
   regressions, too small to claim statistical significance (one question moves
   recall@5 by ~7 points). Scaling to 100–150 is the first next step, and the 5
   unanswerable questions are deliberately easy (absurd premises); *near-miss*
   abstention is the case a real model actually fails.
-- Reranking improves recall@5 but slightly lowers MRR/nDCG here; the offline
-  lexical reranker is crude. A real cross-encoder is expected to fix that.
+- Reranking leaves recall@5 unchanged (0.536) and lowers MRR (0.404 → 0.348),
+  nDCG@5 (0.513 → 0.498) and citation accuracy (0.357 → 0.214) versus +hybrid.
+  The offline lexical reranker is a net negative here, yet it is on by default
+  (`RAG_ENABLE_RERANK=true`); a real cross-encoder has to show a gain before that
+  default is justified.
 
 The pipeline, metrics, and experiment structure are real; the *model* is a
 placeholder so everything runs without keys.
 
 ## Tests
 
-107 tests, no network, no API keys, no Docker (`pytest`, ~2s):
+113 tests, no network, no API keys, no Docker (`pytest`, ~2s):
 
 - **ingestion** — MDX cleaning, frontmatter, heading-aware chunking, chunk-id
   stability, oversized splitting, QC rules (short/duplicate/missing metadata),
   incremental skip, changed-doc replacement without leftovers, zero-chunk
-  convergence, pruning of deleted documents, and fence awareness (code blocks
-  never split; `#` inside a fence is not a heading; `~~~` fences supported)
+  convergence, pruning of deleted documents, all-or-nothing runs (a provider
+  failure mid-ingest leaves store and manifest untouched), and fence awareness
+  (code blocks never split; `#` inside a fence is not a heading; `~~~` fences
+  supported)
 - **retrieval** — BM25 ranking, RRF agreement, store upsert/persist/delete,
-  reranker ordering, stage toggles, doc filtering, and index-integrity guards
-  (dimension mismatch, provider switch, torn write)
+  reranker ordering, stage toggles, doc filtering, index-integrity guards
+  (dimension mismatch, provider switch, torn write), atomic `replace_docs`, and
+  a reader/writer stress test that searches while the index is rewritten
 - **generation** — context numbering, strict/basic prompts, fenced-JSON parsing,
   citation resolution, unknown-citation filtering, confidence clamping,
-  abstention on bad JSON and on citation-less answers
+  abstention on bad JSON and on citation-less answers, and JSON answers that
+  themselves contain code fences
 - **providers** — Mistral request shaping, response index ordering, L2
   normalisation, dimension validation, batching, key handling, retry-on-429 vs
   fail-fast-on-400, usage plumbing (all via mocked HTTP)
@@ -252,7 +279,8 @@ placeholder so everything runs without keys.
   incremental ingest, and a concurrency test proving a slow provider does not
   serialize requests
 - **eval** — recall@k / hit@k / MRR / nDCG / token-F1 / keyword coverage /
-  aggregation / abstention wiring / pricing, plus dataset integrity checks
+  aggregation / abstention wiring / pricing, eval settings pinned independently
+  of `.env`, plus dataset integrity checks
   (unique ids, gold docs exist on disk, unanswerable ratio in band)
 
 CI (`.github/workflows/ci.yml`) runs ruff, format check, `mypy --strict`, the test
@@ -270,7 +298,7 @@ app/
   providers.py    embedder / llm / reranker interfaces + implementations
   service.py      composition root
 eval/             dataset.jsonl, run_eval.py, reports/
-tests/            107 tests
+tests/            113 tests
 scripts/          ingest_cli.py, fetch_corpus.sh
 Dockerfile · docker-compose.yml · .github/workflows/ci.yml · Makefile
 ```
