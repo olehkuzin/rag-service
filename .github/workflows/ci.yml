@@ -19,6 +19,8 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
+          # no uv.lock in this repo; the default glob (**/uv.lock) fails the step
+          cache-dependency-glob: pyproject.toml
 
       # a project venv, like `make install`: the runner's system Python is
       # externally managed, so `uv pip install --system` is not an option
