@@ -25,7 +25,8 @@ class CitationModel(BaseModel):
 class UsageModel(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
-    cost_usd: float = 0.0
+    # None when the provider has no known pricing (e.g. the offline stub)
+    cost_usd: float | None = None
 
 
 class RetrievedChunkModel(BaseModel):

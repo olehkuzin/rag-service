@@ -26,10 +26,15 @@ PRICING = {
 }
 
 
-def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """Estimated USD cost, or None when the model has no known pricing.
+
+    Returning None (rather than 0.0) keeps "unknown/offline" distinguishable from
+    "genuinely free" in traces and eval reports.
+    """
     price = PRICING.get(model)
     if not price:
-        return 0.0
+        return None
     return (input_tokens / 1_000_000) * price["input"] + (output_tokens / 1_000_000) * price[
         "output"
     ]
@@ -50,7 +55,7 @@ class TraceRecord:
     generation_latency_ms: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
-    cost_usd: float = 0.0
+    cost_usd: float | None = None
     model: str = ""
     error: str | None = None
     timestamp: float = field(default_factory=time.time)
@@ -90,9 +95,14 @@ class Tracer:
             "abstain_rate": round(sum(1 for i in items if not i.found) / len(items), 3),
             "p50_latency_ms": round(_pct(latencies, 50), 1),
             "p95_latency_ms": round(_pct(latencies, 95), 1),
-            "avg_cost_usd": round(sum(i.cost_usd for i in items) / len(items), 6),
+            "avg_cost_usd": _avg_cost(items),
             "errors": sum(1 for i in items if i.error),
         }
+
+
+def _avg_cost(items: list[TraceRecord]) -> float | None:
+    known = [i.cost_usd for i in items if i.cost_usd is not None]
+    return round(sum(known) / len(known), 6) if known else None
 
 
 def _pct(sorted_values: list[float], pct: int) -> float:

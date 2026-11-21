@@ -106,3 +106,42 @@ def test_prompt_variant_override_does_not_leak_between_requests(client: TestClie
     # a request without the override must fall back to the configured default
     second = client.post("/ask", json={"question": "models"})
     assert second.json()["prompt_variant"] == "strict"
+
+
+def test_concurrent_asks_do_not_serialize(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow provider must not block other requests.
+
+    Regression test: the async handlers called synchronous provider code
+    directly on the event loop, so N concurrent requests took N x latency.
+    """
+    import threading
+    import time
+
+    from app.service import get_service
+
+    client.post("/ingest", json={"force": True})
+
+    class SlowLLM:
+        def complete(self, *, system: str, user: str, max_tokens: int):
+            time.sleep(0.4)
+            return '{"found": true, "answer": "x", "citations": ["c1"]}', 5, 2
+
+    get_service().generator.llm = SlowLLM()
+
+    started = time.perf_counter()
+    threads = [
+        threading.Thread(
+            target=lambda: client.post("/ask", json={"question": "models", "top_k": 2})
+        )
+        for _ in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.perf_counter() - started
+
+    # 4 x 0.4s serialized would be ~1.6s; concurrent should be well under 1.0s
+    assert elapsed < 1.0, f"requests serialized on the event loop ({elapsed:.2f}s)"

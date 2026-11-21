@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 from app.api.schemas import (
     AskRequest,
@@ -45,7 +46,10 @@ async def ask(request: AskRequest) -> AskResponse:
             config.enable_rerank = request.rerank
 
     try:
-        result, trace = service.ask(
+        # Retrieval and generation are synchronous (httpx, numpy) and would block
+        # the event loop for every other request. Offload to a worker thread.
+        result, trace = await run_in_threadpool(
+            service.ask,
             request.question,
             top_k=request.top_k,
             config=config,
@@ -86,7 +90,7 @@ async def ask(request: AskRequest) -> AskResponse:
         usage=UsageModel(
             input_tokens=trace.input_tokens,
             output_tokens=trace.output_tokens,
-            cost_usd=round(trace.cost_usd, 6),
+            cost_usd=None if trace.cost_usd is None else round(trace.cost_usd, 6),
         ),
         trace_id=trace.trace_id,
         prompt_variant=trace.prompt_variant,
@@ -97,7 +101,7 @@ async def ask(request: AskRequest) -> AskResponse:
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest(request: IngestRequest) -> IngestResponse:
     try:
-        stats = _service().ingest(force=request.force, limit=request.limit)
+        stats = await run_in_threadpool(_service().ingest, force=request.force, limit=request.limit)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"ingestion failed: {exc}") from exc
     payload = stats.summary()

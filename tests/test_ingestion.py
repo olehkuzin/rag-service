@@ -172,3 +172,70 @@ def test_manifest_records_zero_chunk_docs(service: Service, settings: Settings) 
     data = json.loads(manifest_path.read_text())
     # the empty.md fixture is skipped before parsing, but a chunkless doc is recorded
     assert any(d["chunk_count"] >= 0 for d in data["docs"])
+
+
+# --- fence awareness -------------------------------------------------------
+
+
+def test_fenced_code_block_is_never_split(tmp_path: Path, settings: Settings) -> None:
+    """A chunk must not start or end inside a fenced code block.
+
+    dbt docs are full of SQL/Jinja fences with blank lines between statements;
+    splitting on those boundaries produced chunks starting mid-SELECT.
+    """
+    sql = "\n\n".join(f"select {i} as x from t{i}" for i in range(60))
+    body = f"## Section\n\nIntro.\n\n```sql\n{sql}\n```\n\nAfter.\n"
+    path = tmp_path / "fence.md"
+    path.write_text(f"---\ntitle: F\n---\n\n{body}", encoding="utf-8")
+
+    doc = parse_file(path, tmp_path)
+    assert doc is not None
+    chunks = chunk_document(doc, settings)
+    unbalanced = [c for c in chunks if c.text.count("```") % 2]
+    assert unbalanced == [], f"{len(unbalanced)} chunk(s) split a code block"
+
+
+def test_hash_inside_fence_is_not_a_heading(tmp_path: Path, settings: Settings) -> None:
+    """`# comment` inside a bash fence must not become a section title."""
+    body = (
+        "## Real heading\n\nText.\n\n```bash\n# not a heading\necho hi\n```\n\n## Second\n\nTail.\n"
+    )
+    path = tmp_path / "hf.md"
+    path.write_text(f"---\ntitle: T\n---\n\n{body}", encoding="utf-8")
+
+    doc = parse_file(path, tmp_path)
+    assert doc is not None
+    chunks = chunk_document(doc, settings)
+    sections = {c.section for c in chunks}
+    assert sections == {"Real heading", "Second"}
+
+
+def test_tilde_fences_are_respected(tmp_path: Path, settings: Settings) -> None:
+    body = "## H\n\n~~~python\n# not a heading\n~~~\n\nTail.\n"
+    path = tmp_path / "tf.md"
+    path.write_text(f"---\ntitle: T\n---\n\n{body}", encoding="utf-8")
+
+    doc = parse_file(path, tmp_path)
+    assert doc is not None
+    assert {c.section for c in chunk_document(doc, settings)} == {"H"}
+
+
+def test_oversized_single_code_block_is_kept_whole(tmp_path: Path) -> None:
+    """If one fence exceeds the budget, keep it intact rather than cut it."""
+    settings = Settings(
+        corpus_dir=tmp_path,
+        index_dir=tmp_path / "idx",
+        chunk_max_chars=200,
+        chunk_min_chars=10,
+        chunk_overlap_chars=20,
+    )
+    big = "\n".join(f"row {i}" for i in range(200))  # no blank lines -> one block
+    body = f"## S\n\n```sql\n{big}\n```\n"
+    path = tmp_path / "big.md"
+    path.write_text(f"---\ntitle: B\n---\n\n{body}", encoding="utf-8")
+
+    doc = parse_file(path, tmp_path)
+    assert doc is not None
+    chunks = chunk_document(doc, settings)
+    assert len(chunks) == 1
+    assert chunks[0].text.count("```") == 2

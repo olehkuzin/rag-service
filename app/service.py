@@ -119,10 +119,16 @@ class Service:
             generation_latency_ms=generation_ms,
             input_tokens=result.usage_input_tokens,
             output_tokens=result.usage_output_tokens,
-            cost_usd=estimate_cost(
-                self.settings.llm_model,
-                result.usage_input_tokens,
-                result.usage_output_tokens,
+            # the offline stub's token counts are synthetic, so pricing them
+            # would produce a fabricated cost figure
+            cost_usd=(
+                None
+                if self.settings.llm_provider == "fake"
+                else estimate_cost(
+                    self.settings.llm_model,
+                    result.usage_input_tokens,
+                    result.usage_output_tokens,
+                )
             ),
             model=self.settings.llm_model,
             error=result.parse_error,

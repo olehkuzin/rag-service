@@ -172,11 +172,14 @@ Reproduce with `make eval` (writes `eval/reports/latest.{json,md}`).
 
 | variant      | recall@k |  hit@k |    MRR | nDCG@k |    F1 | kw cov | cite acc | answer rate | abstain | p95 ms | cost/q |
 |--------------|---------:|-------:|-------:|-------:|------:|-------:|---------:|------------:|--------:|-------:|-------:|
-| baseline     |    0.286 |  0.357 |  0.226 |  0.309 | 0.074 |  0.208 |    0.143 |       1.000 |   0.000 |    0.3 | 0.0049 |
-| +chunking    |    0.357 |  0.429 |  0.234 |  0.338 | 0.130 |  0.196 |    0.143 |       1.000 |   0.000 |    0.5 | 0.0032 |
-| +hybrid      |    0.464 |  0.500 |  0.386 |  0.482 | 0.128 |  0.268 |    0.357 |       1.000 |   0.000 |    9.9 | 0.0031 |
-| +rerank      |    0.536 |  0.571 |  0.348 |  0.498 | 0.107 |  0.325 |    0.214 |       1.000 |   0.000 |   10.7 | 0.0033 |
-| strict       |    0.536 |  0.571 |  0.348 |  0.498 | 0.107 |  0.325 |    0.214 |       1.000 |   0.200 |   10.7 | 0.0035 |
+| baseline     |    0.286 |  0.357 |  0.226 |  0.309 | 0.074 |  0.208 |    0.143 |       1.000 |   0.000 |    0.5 | n/a |
+| +chunking    |    0.357 |  0.429 |  0.234 |  0.338 | 0.134 |  0.196 |    0.143 |       1.000 |   0.000 |    0.5 | n/a |
+| +hybrid      |    0.536 |  0.571 |  0.404 |  0.513 | 0.128 |  0.268 |    0.357 |       1.000 |   0.000 |    9.9 | n/a |
+| +rerank      |    0.536 |  0.571 |  0.348 |  0.498 | 0.107 |  0.325 |    0.214 |       1.000 |   0.000 |   10.7 | n/a |
+| strict       |    0.536 |  0.571 |  0.348 |  0.498 | 0.107 |  0.325 |    0.214 |       1.000 |   0.200 |   10.5 | n/a |
+
+Cost shows `n/a` under the offline stub: its token counts are synthetic, so
+pricing them produced a fabricated figure. Real costs appear with `--llm mistral`.
 
 Each row adds one stage to the row above. Headline: **recall@5 0.286 → 0.536
 (+87%)** and **hit@5 0.357 → 0.571** from structure-aware chunking + hybrid
@@ -186,8 +189,8 @@ retrieval + reranking.
 
 These are **retrieval-focused** results from the offline defaults (`hash`
 embedder + `fake` LLM), and the generation columns are weak by construction.
-Cost is computed from `mistral-large-latest` list pricing applied to the stub's
-token counts, so treat it as a pricing-table sanity check, not a real spend.
+Cost is `n/a` under the offline stub by design: its token counts are synthetic,
+so reporting a dollar figure would be invented.
 
 - The default `fake` LLM is an **extractive stub** — it echoes the top chunk, so
   F1/keyword coverage measure *retrieval* quality, not model quality. Real F1
@@ -199,8 +202,10 @@ token counts, so treat it as a pricing-table sanity check, not a real spend.
   The harness *does* verify abstention plumbing (strict mode, unanswerable
   questions) and would improve with a real model.
 - The dataset is 19 questions — enough to exercise every metric and catch
-  regressions, too small to claim statistical significance. Scaling to 100–150
-  is the first next step.
+  regressions, too small to claim statistical significance (one question moves
+  recall@5 by ~7 points). Scaling to 100–150 is the first next step, and the 5
+  unanswerable questions are deliberately easy (absurd premises); *near-miss*
+  abstention is the case a real model actually fails.
 - Reranking improves recall@5 but slightly lowers MRR/nDCG here; the offline
   lexical reranker is crude. A real cross-encoder is expected to fix that.
 
@@ -209,12 +214,13 @@ placeholder so everything runs without keys.
 
 ## Tests
 
-62 tests, no network, no API keys, no Docker (`pytest`, ~1s):
+95 tests, no network, no API keys, no Docker (`pytest`, ~2s):
 
 - **ingestion** — MDX cleaning, frontmatter, heading-aware chunking, chunk-id
   stability, oversized splitting, QC rules (short/duplicate/missing metadata),
   incremental skip, changed-doc replacement without leftovers, zero-chunk
-  convergence, and pruning of deleted documents
+  convergence, pruning of deleted documents, and fence awareness (code blocks
+  never split; `#` inside a fence is not a heading; `~~~` fences supported)
 - **retrieval** — BM25 ranking, RRF agreement, store upsert/persist/delete,
   reranker ordering, stage toggles, doc filtering, and index-integrity guards
   (dimension mismatch, provider switch, torn write)
@@ -226,7 +232,11 @@ placeholder so everything runs without keys.
   fail-fast-on-400, usage plumbing (all via mocked HTTP)
 - **api** — health, 503 before ingest, ingest→ask, validation (422), per-request
   feature overrides without leaking into the singleton, trace recording,
-  incremental ingest
+  incremental ingest, and a concurrency test proving a slow provider does not
+  serialize requests
+- **eval** — recall@k / hit@k / MRR / nDCG / token-F1 / keyword coverage /
+  aggregation / abstention wiring / pricing, plus dataset integrity checks
+  (unique ids, gold docs exist on disk, unanswerable ratio in band)
 
 CI (`.github/workflows/ci.yml`) runs ruff, format check, `mypy --strict`, the test
 suite with coverage, and builds the Docker image on every push.
@@ -243,7 +253,7 @@ app/
   providers.py    embedder / llm / reranker interfaces + implementations
   service.py      composition root
 eval/             dataset.jsonl, run_eval.py, reports/
-tests/            62 tests
+tests/            95 tests
 scripts/          ingest_cli.py, fetch_corpus.sh
 Dockerfile · docker-compose.yml · .github/workflows/ci.yml · Makefile
 ```
@@ -260,6 +270,12 @@ Dockerfile · docker-compose.yml · .github/workflows/ci.yml · Makefile
    the record shape is already defined.
 5. **Stretch** — query decomposition for multi-hop questions, semantic caching,
    scheduled re-ingestion, and an MCP `search_docs` server over this corpus.
+
+Known gaps: no `pre-commit` config (CI runs the same checks); no faithfulness /
+LLM-as-judge metric yet — `citation_accuracy` measures whether a cited chunk
+came from a gold document, **not** whether the answer is supported by the text
+it cites; `langfuse_enabled`, `api_host` and `api_port` are dead config (the
+tracer is local and uvicorn is started manually).
 
 Scope: **local / single-machine deployment only.** There is no cloud deployment,
 autoscaling or managed secrets story here, by choice. Docker Compose is the

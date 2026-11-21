@@ -260,8 +260,7 @@ class QuestionResult:
     keywords: float = 0.0
     citation_acc: float = 0.0
     latency_ms: float = 0.0
-    cost_usd: float = 0.0
-    abstained: bool = False
+    cost_usd: float | None = None
     answer: str = ""
     error: str | None = None
 
@@ -272,8 +271,8 @@ class VariantReport:
     description: str
     k: int
     n_questions: int
-    metrics: dict[str, float]
-    per_type: dict[str, dict[str, float]] = field(default_factory=dict)
+    metrics: dict[str, float | None]
+    per_type: dict[str, dict[str, float | None]] = field(default_factory=dict)
     results: list[QuestionResult] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -297,7 +296,7 @@ class VariantReport:
                     "keywords": round(r.keywords, 4),
                     "citation_acc": round(r.citation_acc, 4),
                     "latency_ms": round(r.latency_ms, 1),
-                    "cost_usd": round(r.cost_usd, 6),
+                    "cost_usd": None if r.cost_usd is None else round(r.cost_usd, 6),
                     "answer": r.answer[:500],
                 }
                 for r in self.results
@@ -374,7 +373,6 @@ def run_variant(
                     citation_acc=cit,
                     latency_ms=latency,
                     cost_usd=trace.cost_usd,
-                    abstained=not gen.found,
                     answer=gen.answer,
                     error=gen.parse_error,
                 )
@@ -417,22 +415,21 @@ def _aggregate(variant: Variant, results: list[QuestionResult], k: int) -> Varia
         "keyword_coverage": mean([r.keywords for r in answerable]),
         "citation_accuracy": mean([r.citation_acc for r in answerable if r.found]),
         "answer_rate": mean([1.0 if r.found else 0.0 for r in answerable]),
-        "abstention_rate_unanswerable": mean([1.0 if r.abstained else 0.0 for r in unanswerable]),
+        # derived from `found` (single source of truth) rather than a parallel flag
+        "abstention_rate_unanswerable": mean([1.0 if not r.found else 0.0 for r in unanswerable]),
         "p50_latency_ms": pct(latencies, 50),
         "p95_latency_ms": pct(latencies, 95),
-        "cost_per_query_usd": round(statistics.fmean([r.cost_usd for r in results]), 6)
-        if results
-        else 0.0,
+        "cost_per_query_usd": _mean_cost(results),
         "errors": sum(1 for r in results if r.error),
     }
 
-    per_type: dict[str, dict[str, float]] = {}
+    per_type: dict[str, dict[str, float | None]] = {}
     for qtype in sorted({r.type for r in results}):
         subset = [r for r in results if r.type == qtype]
         if qtype == "unanswerable":
             per_type[qtype] = {
                 "n": len(subset),
-                "abstention_rate": mean([1.0 if r.abstained else 0.0 for r in subset]),
+                "abstention_rate": mean([1.0 if not r.found else 0.0 for r in subset]),
             }
         else:
             per_type[qtype] = {
@@ -451,6 +448,11 @@ def _aggregate(variant: Variant, results: list[QuestionResult], k: int) -> Varia
         per_type=per_type,
         results=results,
     )
+
+
+def _mean_cost(results: list[QuestionResult]) -> float | None:
+    known = [r.cost_usd for r in results if r.cost_usd is not None]
+    return round(statistics.fmean(known), 6) if known else None
 
 
 def results_table(reports: list[VariantReport]) -> str:
@@ -488,7 +490,7 @@ def results_table(reports: list[VariantReport]) -> str:
             if col in {"p95_latency_ms"}:
                 cells.append(f"{value:>10.1f}")
             elif col == "cost_per_query_usd":
-                cells.append(f"{value:>10.5f}")
+                cells.append(f"{'n/a' if value is None else f'{value:.5f}':>10}")
             else:
                 cells.append(f"{value:>10.3f}")
         lines.append(f"| {report.variant:<12} | " + " | ".join(cells) + " |")
