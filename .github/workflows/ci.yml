@@ -19,24 +19,27 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
+          # no uv.lock in this repo; the default glob (**/uv.lock) fails the step
+          cache-dependency-glob: pyproject.toml
 
-      - name: Set up Python 3.12
-        run: uv python install 3.12
-
+      # a project venv, like `make install`: the runner's system Python is
+      # externally managed, so `uv pip install --system` is not an option
       - name: Install dependencies
-        run: uv pip install --system -e ".[dev]"
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv -e ".[dev]"
 
       - name: Lint (ruff)
-        run: ruff check .
+        run: .venv/bin/ruff check .
 
       - name: Format check (ruff)
-        run: ruff format --check .
+        run: .venv/bin/ruff format --check .
 
       - name: Type check (mypy)
-        run: mypy app eval scripts
+        run: .venv/bin/mypy app eval scripts
 
       - name: Tests
-        run: pytest -q --cov=app --cov-report=term-missing
+        run: .venv/bin/pytest -q --cov=app --cov-report=term-missing
 
   build:
     runs-on: ubuntu-latest

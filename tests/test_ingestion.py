@@ -270,3 +270,45 @@ def test_real_env_wins_over_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("MISTRAL_API_KEY", "from-shell")
     load_env_file(env)
     assert os.environ["MISTRAL_API_KEY"] == "from-shell"
+
+
+def test_provider_failure_mid_ingest_leaves_store_and_manifest_untouched(
+    service: Service, settings: Settings
+) -> None:
+    """Regression: a failed ingest used to delete docs from the live store before re-embedding."""
+    import numpy as np
+    from app.providers import ProviderError
+
+    class FailsOnSecondCall:
+        dim = settings.embedding_dim
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def embed_documents(self, texts: list[str]) -> np.ndarray:
+            self.calls += 1
+            if self.calls >= 2:
+                raise ProviderError("401 from embeddings: key expired")
+            return np.zeros((len(texts), self.dim), dtype=np.float32)
+
+        def embed_query(self, text: str) -> np.ndarray:
+            return np.zeros(self.dim, dtype=np.float32)
+
+    before_ids = sorted(c.chunk_id for c in service.store.all_chunks())
+    manifest_path = settings.index_dir / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    vectors_before = (settings.index_dir / "vectors.npy").read_bytes()
+
+    # change both docs so the second embedding call happens
+    for name in ("models.md", "tests.md"):
+        path = settings.corpus_dir / "build" / name
+        extra = path.read_text(encoding="utf-8") + "\n\nAn extra paragraph about dbt.\n"
+        path.write_text(extra, encoding="utf-8")
+
+    service.ingestor.embedder = FailsOnSecondCall()
+    with pytest.raises(ProviderError):
+        service.ingest()
+
+    assert sorted(c.chunk_id for c in service.store.all_chunks()) == before_ids
+    assert manifest_path.read_bytes() == manifest_before
+    assert (settings.index_dir / "vectors.npy").read_bytes() == vectors_before

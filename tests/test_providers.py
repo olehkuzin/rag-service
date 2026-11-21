@@ -141,6 +141,8 @@ def test_llm_shapes_request_and_reads_usage(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert captured["json"]["model"] == "mistral-large-latest"
     assert captured["json"]["response_format"] == {"type": "json_object"}
+    # greedy decoding must pin top_p=1 or Mistral answers 400
+    assert captured["json"]["temperature"] == 0.0 and captured["json"]["top_p"] == 1.0
     assert captured["json"]["messages"][0] == {"role": "system", "content": "sys"}
     assert captured["json"]["messages"][1] == {"role": "user", "content": "usr"}
     assert text.startswith("{") and "found" in text
@@ -242,3 +244,43 @@ def test_provider_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ProviderError):
         MistralEmbedder(dim=2).embed_query("x")
     assert len(calls) == 1
+
+
+def test_mistral_chunked_message_content_is_joined() -> None:
+    """Regression: mistral-large-latest returns typed content chunks; .strip() crashed."""
+    from app.providers import _message_text
+
+    chunks = [
+        {"type": "thinking", "thinking": [{"type": "text", "text": "internal"}]},
+        {"type": "text", "text": '{"found": true, '},
+        {"type": "text", "text": '"answer": "x"}'},
+    ]
+    assert _message_text(chunks) == '{"found": true, "answer": "x"}'
+    assert _message_text("plain") == "plain"
+    assert _message_text(None) == ""
+
+
+def test_mistral_truncated_empty_reply_is_a_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reasoning model that spends max_tokens thinking must not look like an abstention."""
+    import httpx
+    from app.providers import MistralLLM, ProviderError
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    body = {
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {
+                    "content": [{"type": "thinking", "thinking": [{"type": "text", "text": "..."}]}]
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 1024},
+    }
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda *a, **k: httpx.Response(200, json=body, request=httpx.Request("POST", a[0])),
+    )
+    with pytest.raises(ProviderError, match="max_tokens"):
+        MistralLLM("mistral-large-latest").complete(system="s", user="u", max_tokens=1024)

@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -304,9 +305,55 @@ class VariantReport:
         }
 
 
+HASH_EMBEDDING_DIM = 512  # the offline hash embedder's documented dimension
+MISTRAL_EMBEDDING_DIM = 1024
+
+
+def eval_settings(
+    corpus: Path, llm: str, embedder: str, embedding_dim: int | None = None
+) -> Settings:
+    """Settings for an eval run, pinned so results do not depend on the developer's `.env`.
+
+    `.env` is exported into the environment for API keys, which would otherwise
+    leak e.g. RAG_EMBEDDING_DIM=1024 (set for Mistral) into a hash-embedder run.
+    """
+    if embedding_dim is None:
+        embedding_dim = MISTRAL_EMBEDDING_DIM if embedder == "mistral" else HASH_EMBEDDING_DIM
+    return Settings(
+        corpus_dir=corpus,
+        llm_provider=llm,
+        embedding_provider=embedder,
+        embedding_dim=embedding_dim,
+    )
+
+
+def index_dir_for(settings: Settings, chunk_strategy: str, workdir: Path) -> Path:
+    """Cache key for an eval index: everything that changes the stored vectors."""
+    chunking = (
+        f"{settings.chunk_max_chars}:{settings.chunk_min_chars}:{settings.chunk_overlap_chars}"
+    )
+    digest = hashlib.sha256(chunking.encode()).hexdigest()[:8]
+    return workdir / (
+        f"index_{chunk_strategy}_{settings.embedding_provider}_{settings.embedding_dim}_{digest}"
+    )
+
+
+def settings_summary(settings: Settings) -> dict[str, object]:
+    return {
+        "embedding_provider": settings.embedding_provider,
+        "embedding_model": settings.embedding_model,
+        "embedding_dim": settings.embedding_dim,
+        "llm_provider": settings.llm_provider,
+        "llm_model": settings.llm_model,
+        "chunk_max_chars": settings.chunk_max_chars,
+        "chunk_min_chars": settings.chunk_min_chars,
+        "chunk_overlap_chars": settings.chunk_overlap_chars,
+    }
+
+
 def _build_service(settings: Settings, variant: Variant, workdir: Path) -> Service:
-    """Fresh service + index per chunking strategy (cache by strategy)."""
-    index_dir = workdir / f"index_{variant.chunk_strategy}_{settings.embedding_provider}"
+    """Service + cached index per chunking strategy, synced incrementally with the corpus."""
+    index_dir = index_dir_for(settings, variant.chunk_strategy, workdir)
     variant_settings = settings.model_copy(
         update={
             "index_dir": index_dir,
@@ -317,8 +364,7 @@ def _build_service(settings: Settings, variant: Variant, workdir: Path) -> Servi
         }
     )
     svc = Service(variant_settings)
-    if svc.store.count() == 0:
-        svc.ingest(force=True)
+    svc.ingest()  # incremental: a no-op when the cached index matches the corpus
     return svc
 
 
@@ -532,16 +578,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no matching variants; available: {[v.name for v in DEFAULT_VARIANTS]}")
             return 2
 
-    overrides: dict[str, object] = {
-        "corpus_dir": Path(args.corpus),
-        "llm_provider": args.llm,
-        "embedding_provider": args.embedder,
-    }
-    if args.embedding_dim is not None:
-        overrides["embedding_dim"] = args.embedding_dim
-    elif args.embedder == "mistral":
-        overrides["embedding_dim"] = 1024
-    base_settings = Settings(**overrides)  # type: ignore[arg-type]
+    base_settings = eval_settings(Path(args.corpus), args.llm, args.embedder, args.embedding_dim)
     workdir = Path(args.workdir)
     reports: list[VariantReport] = []
     services: dict[str, Service] = {}
@@ -574,6 +611,7 @@ def main(argv: list[str] | None = None) -> int:
         "k": args.k,
         "n_questions": len(questions),
         "corpus": args.corpus,
+        "settings": settings_summary(base_settings),
         "variants": [r.to_dict() for r in reports],
         "table": table,
     }

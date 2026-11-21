@@ -12,6 +12,7 @@ import json
 import shutil
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -30,6 +31,10 @@ class VectorStore(Protocol):
 
     def delete_docs(self, doc_ids: Sequence[str]) -> int: ...
 
+    def replace_docs(
+        self, doc_ids: Sequence[str], chunks: Sequence[Chunk], vectors: np.ndarray
+    ) -> int: ...
+
     def existing_hashes(self) -> dict[str, str]: ...
 
     def all_chunks(self) -> list[Chunk]: ...
@@ -37,16 +42,29 @@ class VectorStore(Protocol):
     def count(self) -> int: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _Snapshot:
+    """Vectors and their payloads, row-aligned. Never mutated once published."""
+
+    vectors: np.ndarray
+    payloads: tuple[dict[str, Any], ...]
+
+
 class LocalVectorStore:
-    """Numpy-backed cosine store with JSON metadata, persisted to a directory."""
+    """Numpy-backed cosine store with JSON metadata, persisted to a directory.
+
+    Safe for concurrent readers during a write: all state lives in one immutable
+    `_Snapshot`; writers build a new one (copy-on-write) and publish it with a
+    single assignment, and every read works on the snapshot it grabbed first.
+    Writers themselves must be serialised by the caller (the service holds a lock).
+    """
 
     def __init__(self, path: Path, dim: int, embedding_id: str = "") -> None:
         self.path = Path(path)
         self.dim = dim
         # e.g. "mistral:mistral-embed" — lets load() detect a provider switch
         self.embedding_id = embedding_id
-        self._vectors: np.ndarray = np.zeros((0, dim), dtype=np.float32)
-        self._payloads: list[dict[str, Any]] = []
+        self._snap = _Snapshot(np.zeros((0, dim), dtype=np.float32), ())
         # set by load() when an incompatible index was set aside
         self.quarantined_reason: str | None = None
         self.quarantined_to: Path | None = None
@@ -77,8 +95,7 @@ class LocalVectorStore:
             self._quarantine(reason=str(exc))
             return
 
-        self._vectors = vectors
-        self._payloads = payloads
+        self._snap = _Snapshot(vectors.astype(np.float32, copy=False), tuple(payloads))
 
     def _check_compatible(self, vectors: np.ndarray) -> None:
         actual = vectors.shape[1] if vectors.ndim == 2 else None
@@ -105,68 +122,87 @@ class LocalVectorStore:
         self.quarantined_to = dest
 
     def save(self) -> None:
+        """Persist the current snapshot; each file is replaced atomically."""
+        snap = self._snap
         self.path.mkdir(parents=True, exist_ok=True)
-        np.save(self.path / "vectors.npy", self._vectors)
-        (self.path / "payloads.json").write_text(
-            json.dumps(self._payloads, ensure_ascii=False), encoding="utf-8"
-        )
-        (self.path / "index_meta.json").write_text(
-            json.dumps(
-                {
-                    "embedding_id": self.embedding_id,
-                    "dim": self.dim,
-                    "count": len(self._payloads),
-                },
-                indent=1,
-            ),
-            encoding="utf-8",
-        )
 
-    # -- writes ------------------------------------------------------------
-    def upsert(self, chunks: Sequence[Chunk], vectors: np.ndarray) -> int:
+        def write(name: str, writer: Any) -> None:
+            tmp = self.path / f".{name}.tmp"
+            with tmp.open("wb") as fh:
+                writer(fh)
+            tmp.replace(self.path / name)
+
+        write("vectors.npy", lambda fh: np.save(fh, snap.vectors))
+        payloads_json = json.dumps(list(snap.payloads), ensure_ascii=False).encode("utf-8")
+        write("payloads.json", lambda fh: fh.write(payloads_json))
+        meta = {"embedding_id": self.embedding_id, "dim": self.dim, "count": len(snap.payloads)}
+        write("index_meta.json", lambda fh: fh.write(json.dumps(meta, indent=1).encode("utf-8")))
+
+    # -- writes (copy-on-write; callers serialise writers) -----------------
+    def _replace(
+        self, remove_doc_ids: Sequence[str], chunks: Sequence[Chunk], vectors: np.ndarray
+    ) -> int:
+        """Drop `remove_doc_ids`, then upsert `chunks`, publishing one new snapshot."""
         if len(chunks) != len(vectors):
             raise ValueError("chunks and vectors length mismatch")
-        if len(chunks) == 0:
-            return 0
+        snap = self._snap
+        targets = set(remove_doc_ids)
+        keep = [i for i, p in enumerate(snap.payloads) if p["doc_id"] not in targets]
+        removed = len(snap.payloads) - len(keep)
 
-        by_id = {p["chunk_id"]: i for i, p in enumerate(self._payloads)}
+        rows = np.asarray(vectors, dtype=np.float32).reshape(len(chunks), self.dim)
+        merged_vecs = snap.vectors[keep]  # fancy indexing copies
+        merged_payloads = [snap.payloads[i] for i in keep]
+        position = {p["chunk_id"]: i for i, p in enumerate(merged_payloads)}
+        base = len(merged_payloads)  # rows < base live in merged_vecs, the rest in new_vecs
         new_vecs: list[np.ndarray] = []
-        new_payloads: list[dict[str, Any]] = []
-        for chunk, vec in zip(chunks, vectors, strict=True):
+        for chunk, vec in zip(chunks, rows, strict=True):
             payload = chunk.to_payload()
-            if chunk.chunk_id in by_id:
-                self._payloads[by_id[chunk.chunk_id]] = payload
-                self._vectors[by_id[chunk.chunk_id]] = vec
+            if chunk.chunk_id in position:
+                row = position[chunk.chunk_id]
+                merged_payloads[row] = payload
+                if row < base:
+                    merged_vecs[row] = vec
+                else:
+                    new_vecs[row - base] = vec
             else:
-                new_payloads.append(payload)
+                position[chunk.chunk_id] = len(merged_payloads)
+                merged_payloads.append(payload)
                 new_vecs.append(vec)
-
         if new_vecs:
-            self._vectors = np.vstack([self._vectors, np.vstack(new_vecs).astype(np.float32)])
-            self._payloads.extend(new_payloads)
+            merged_vecs = np.vstack([merged_vecs, np.vstack(new_vecs)])
+
+        if removed or len(chunks):
+            self._snap = _Snapshot(merged_vecs, tuple(merged_payloads))
+        return removed
+
+    def upsert(self, chunks: Sequence[Chunk], vectors: np.ndarray) -> int:
+        self._replace((), chunks, vectors)
         return len(chunks)
 
     def delete_docs(self, doc_ids: Sequence[str]) -> int:
-        targets = set(doc_ids)
-        keep = [i for i, p in enumerate(self._payloads) if p["doc_id"] not in targets]
-        removed = len(self._payloads) - len(keep)
-        if removed:
-            self._vectors = self._vectors[keep] if keep else np.zeros((0, self.dim), np.float32)
-            self._payloads = [self._payloads[i] for i in keep]
-        return removed
+        return self._replace(doc_ids, (), np.zeros((0, self.dim), np.float32))
+
+    def replace_docs(
+        self, doc_ids: Sequence[str], chunks: Sequence[Chunk], vectors: np.ndarray
+    ) -> int:
+        """Atomically drop every chunk of `doc_ids` and insert `chunks`. Returns chunks written."""
+        self._replace(doc_ids, chunks, vectors)
+        return len(chunks)
 
     # -- reads -------------------------------------------------------------
     def search(
         self, vector: np.ndarray, top_k: int, doc_ids: Sequence[str] | None = None
     ) -> list[ScoredChunk]:
-        if len(self._payloads) == 0:
+        snap = self._snap  # one consistent view for the whole search
+        if len(snap.payloads) == 0:
             return []
         q = np.asarray(vector, dtype=np.float32).reshape(-1)
-        scores = self._vectors @ q  # vectors are L2-normalised at embed time
+        scores = snap.vectors @ q  # vectors are L2-normalised at embed time
 
         if doc_ids:
             allowed = set(doc_ids)
-            mask = np.array([p["doc_id"] in allowed for p in self._payloads])
+            mask = np.array([p["doc_id"] in allowed for p in snap.payloads])
             scores = np.where(mask, scores, -np.inf)
 
         top_k = min(top_k, len(scores))
@@ -179,7 +215,7 @@ class LocalVectorStore:
                 continue
             results.append(
                 ScoredChunk(
-                    chunk=Chunk.from_payload(self._payloads[idx]),
+                    chunk=Chunk.from_payload(snap.payloads[idx]),
                     score=score,
                     vector_score=score,
                     rank=rank + 1,
@@ -190,19 +226,19 @@ class LocalVectorStore:
     def existing_hashes(self) -> dict[str, str]:
         """Map doc_id -> doc-level content hash (not the per-chunk hash)."""
         out: dict[str, str] = {}
-        for p in self._payloads:
+        for p in self._snap.payloads:
             out[p["doc_id"]] = p.get("doc_content_hash", "")
         return out
 
     def all_chunks(self) -> list[Chunk]:
-        return [Chunk.from_payload(p) for p in self._payloads]
+        return [Chunk.from_payload(p) for p in self._snap.payloads]
 
     def count(self) -> int:
-        return len(self._payloads)
+        return len(self._snap.payloads)
 
     def chunks_by_doc(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
-        for p in self._payloads:
+        for p in self._snap.payloads:
             out.setdefault(p["doc_id"], []).append(p["chunk_id"])
         return out
 
@@ -289,6 +325,14 @@ class QdrantVectorStore:
             ),
         )
         return len(doc_ids)
+
+    def replace_docs(
+        self, doc_ids: Sequence[str], chunks: Sequence[Chunk], vectors: np.ndarray
+    ) -> int:
+        # Not atomic on Qdrant: readers can briefly see the docs missing between the calls.
+        if doc_ids:
+            self.delete_docs(doc_ids)
+        return self.upsert(chunks, vectors) if len(chunks) else 0
 
     def existing_hashes(self) -> dict[str, str]:
         out: dict[str, str] = {}

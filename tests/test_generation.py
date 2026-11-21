@@ -122,3 +122,54 @@ def test_abstains_with_no_chunks() -> None:
     gen = Generator(FakeLLM(), __import__("app.config", fromlist=["Settings"]).Settings())
     result = gen.generate("question", [])
     assert result.found is False
+
+
+def _answer_with_code() -> str:
+    return json.dumps(
+        {
+            "found": True,
+            "answer": (
+                "Use this model:\n```sql\nselect * from {{ ref('orders') }}\n```\n"
+                "Then run dbt build."
+            ),
+            "citations": ["c1"],
+            "confidence": 0.9,
+        }
+    )
+
+
+def test_json_answer_containing_a_code_fence_parses_in_strict_mode() -> None:
+    """Regression: the fence regex used to grab the SQL inside the JSON and abstain."""
+    _, lookup = build_context([_scored("a", "text")])
+    result, err = parse_response(_answer_with_code(), lookup, "strict")
+    assert err is None
+    assert result.found is True
+    assert "select * from {{ ref('orders') }}" in result.answer
+    assert result.citations[0].chunk_id == "a"
+
+
+def test_json_answer_containing_a_code_fence_parses_in_basic_mode() -> None:
+    _, lookup = build_context([_scored("a", "text")])
+    result, err = parse_response(_answer_with_code(), lookup, "basic")
+    assert err is None
+    assert result.found is True
+    assert result.answer.startswith("Use this model:")  # not the raw JSON blob
+    assert result.citations[0].chunk_id == "a"
+
+
+def test_fenced_json_whose_answer_contains_a_fence_parses() -> None:
+    _, lookup = build_context([_scored("a", "text")])
+    raw = f"```json\n{_answer_with_code()}\n```"
+    result, err = parse_response(raw, lookup, "strict")
+    assert err is None
+    assert result.found is True
+    assert "```sql" in result.answer
+
+
+def test_json_after_prose_preamble_parses() -> None:
+    _, lookup = build_context([_scored("a", "text")])
+    raw = 'Here is the answer:\n{"found": true, "answer": "x", "citations": ["c1"]}\nHope it helps.'
+    result, err = parse_response(raw, lookup, "strict")
+    assert err is None
+    assert result.found is True
+    assert result.answer == "x"

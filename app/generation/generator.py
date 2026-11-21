@@ -86,26 +86,7 @@ def parse_response(
     raw: str, lookup: dict[str, ScoredChunk], variant: str
 ) -> tuple[GenerationResult, str | None]:
     """Parse model output into structured form. Never raises on bad JSON."""
-    text = raw.strip()
-    # tolerate fenced code blocks around JSON
-    fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
-    if fence:
-        text = fence.group(1).strip()
-
-    # Tolerate minor wrapping noise from real models (Mistral json_object mode is
-    # clean, but prose preambles and trailing text still happen).
-    if not text.startswith("{"):
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end > start:
-            text = text[start : end + 1]
-
-    data: dict[str, Any] | None = None
-    if text.startswith("{"):
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            data = None
+    data = _extract_json_object(raw)
 
     if data is None:
         if variant == "strict":
@@ -174,6 +155,44 @@ def parse_response(
         ),
         None,
     )
+
+
+_WHOLE_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+
+
+def _load_object(text: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_json_object(raw: str) -> dict[str, Any] | None:
+    """Find the JSON object in a model response, most literal reading first.
+
+    Order matters: a valid JSON answer may itself contain a markdown code block
+    (```sql ... ``` is common for dbt), so fence-stripping must never run before
+    the response has been tried as plain JSON, and only applies when the fence
+    wraps the whole response.
+    """
+    text = raw.strip()
+    # 1) the response is the JSON object (json_object mode)
+    data = _load_object(text)
+    if data is not None:
+        return data
+    # 2) the whole response is one fenced block around the JSON
+    fence = _WHOLE_FENCE_RE.match(text)
+    if fence:
+        text = fence.group(1).strip()
+        data = _load_object(text)
+        if data is not None:
+            return data
+    # 3) prose before/after the object
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return _load_object(text[start : end + 1])
+    return None
 
 
 def _resolvable(cited_ids: list[str], lookup: dict[str, ScoredChunk]) -> bool:
