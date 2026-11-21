@@ -39,7 +39,9 @@ docs ──► parse (frontmatter, MDX clean)          POST /ask
 
 Every external dependency (embedder, LLM, reranker, vector store) sits behind a
 `Protocol`, so tests, eval variants and model comparisons swap implementations
-without touching call sites.
+without touching call sites. Design decisions (incremental all-or-nothing
+ingestion, lock-free consistent reads, cite-or-abstain parsing) are explained in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 | Layer | Implementation |
 |---|---|
@@ -301,6 +303,7 @@ eval/             dataset.jsonl, run_eval.py, reports/
 tests/            113 tests
 scripts/          ingest_cli.py, fetch_corpus.sh
 Dockerfile · docker-compose.yml · .github/workflows/ci.yml · Makefile
+ARCHITECTURE.md   design and rationale · CLAUDE.md   guidance for coding agents
 ```
 
 ## Limitations and next steps
