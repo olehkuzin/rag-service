@@ -17,6 +17,7 @@ from eval.run_eval import (
     Variant,
     _aggregate,
     _mean_cost,
+    citation_accuracy,
     hit_at_k,
     keyword_coverage,
     load_dataset,
@@ -74,6 +75,24 @@ def test_ndcg_penalises_late_hits() -> None:
 def test_ndcg_bounded() -> None:
     value = ndcg_at_k(["x.md", "y.md"], GOLD, k=2)
     assert 0.0 <= value <= 1.0
+
+
+def test_ndcg_counts_each_gold_doc_once() -> None:
+    """Several chunks of one gold doc must not push nDCG above 1 (regression)."""
+    gold = ["docs/build/a.md"]
+    top5 = ["docs/build/a.md"] * 3 + ["x.md", "y.md"]
+    assert ndcg_at_k(top5, gold, k=5) == pytest.approx(1.0)
+    # a repeated gold doc earns no extra gain at its later ranks
+    once = ndcg_at_k(["x.md", "docs/build/a.md", "y.md"], gold, k=3)
+    repeated = ndcg_at_k(["x.md", "docs/build/a.md", "docs/build/a.md"], gold, k=3)
+    assert repeated == pytest.approx(once)
+
+
+def test_citation_accuracy_counts_distinct_cited_chunks() -> None:
+    paths = {"c-gold": "docs/build/a.md", "c-other": "x.md"}
+    assert citation_accuracy(["c-gold", "c-gold", "c-other"], GOLD, paths) == pytest.approx(0.5)
+    assert citation_accuracy([], GOLD, paths) == 0.0
+    assert citation_accuracy(["unknown"], GOLD, paths) == 0.0
 
 
 # --- generation metrics ---------------------------------------------------

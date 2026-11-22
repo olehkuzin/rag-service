@@ -99,7 +99,7 @@ make install          # uv venv + editable install
 make corpus           # fetch the dbt docs into data/corpus (gitignored)
 make ingest           # parse → chunk → QC → embed → upsert
 make ask              # interactive question
-make test             # 113 tests
+make test             # 116 tests
 make eval             # run all evaluation variants
 .venv/bin/uvicorn app.main:app --reload
 ```
@@ -209,11 +209,11 @@ Reproduce with `make eval` (writes `eval/reports/latest.{json,md}`).
 
 | variant      |   recall@k |      hit@k |        MRR |     nDCG@k |         F1 |     kw cov |   cite acc | answer rate |    abstain |     p95 ms |     cost/q |
 |--------------|------------|------------|------------|------------|------------|------------|------------|------------|------------|------------|------------|
-| baseline     |      0.286 |      0.357 |      0.226 |      0.309 |      0.076 |      0.208 |      0.143 |      1.000 |      0.000 |        0.3 |        n/a |
-| +chunking    |      0.357 |      0.429 |      0.234 |      0.338 |      0.134 |      0.196 |      0.143 |      1.000 |      0.000 |        0.6 |        n/a |
-| +hybrid      |      0.536 |      0.571 |      0.404 |      0.513 |      0.128 |      0.268 |      0.357 |      1.000 |      0.000 |        8.8 |        n/a |
-| +rerank      |      0.536 |      0.571 |      0.348 |      0.498 |      0.107 |      0.325 |      0.214 |      1.000 |      0.000 |       10.3 |        n/a |
-| strict       |      0.536 |      0.571 |      0.348 |      0.498 |      0.107 |      0.325 |      0.214 |      1.000 |      0.000 |        9.8 |        n/a |
+| baseline     |      0.286 |      0.357 |      0.226 |      0.228 |      0.076 |      0.208 |      0.143 |      1.000 |      0.000 |        0.4 |        n/a |
+| +chunking    |      0.357 |      0.429 |      0.234 |      0.258 |      0.134 |      0.196 |      0.143 |      1.000 |      0.000 |        0.5 |        n/a |
+| +hybrid      |      0.536 |      0.571 |      0.404 |      0.432 |      0.128 |      0.268 |      0.357 |      1.000 |      0.000 |        7.8 |        n/a |
+| +rerank      |      0.536 |      0.571 |      0.348 |      0.386 |      0.107 |      0.325 |      0.214 |      1.000 |      0.000 |        8.7 |        n/a |
+| strict       |      0.536 |      0.571 |      0.348 |      0.386 |      0.107 |      0.325 |      0.214 |      1.000 |      0.000 |        8.6 |        n/a |
 
 Cost shows `n/a` under the offline stub: its token counts are synthetic, so
 pricing them produced a fabricated figure. Real costs appear with `--llm mistral`.
@@ -221,6 +221,10 @@ pricing them produced a fabricated figure. Real costs appear with `--llm mistral
 Each row adds one stage to the row above. Headline: **recall@5 0.286 → 0.536
 (+87%)** and **hit@5 0.357 → 0.571** from structure-aware chunking + hybrid
 retrieval. Reranking adds no recall on top of that (see below).
+
+nDCG@k counts each gold document once, at its first rank. An earlier version
+credited every retrieved chunk of a gold doc, which inflated the column (e.g.
++hybrid 0.513, now 0.432); the other columns were unaffected.
 
 ### Honest reading of these numbers
 
@@ -246,7 +250,7 @@ so reporting a dollar figure would be invented.
   unanswerable questions are deliberately easy (absurd premises); *near-miss*
   abstention is the case a real model actually fails.
 - Reranking leaves recall@5 unchanged (0.536) and lowers MRR (0.404 → 0.348),
-  nDCG@5 (0.513 → 0.498) and citation accuracy (0.357 → 0.214) versus +hybrid.
+  nDCG@5 (0.432 → 0.386) and citation accuracy (0.357 → 0.214) versus +hybrid.
   The offline lexical reranker is a net negative here, yet it is on by default
   (`RAG_ENABLE_RERANK=true`); a real cross-encoder has to show a gain before that
   default is justified.
@@ -256,7 +260,7 @@ placeholder so everything runs without keys.
 
 ## Tests
 
-113 tests, no network, no API keys, no Docker (`pytest`, ~2s):
+116 tests, no network, no API keys, no Docker (`pytest`, ~2s):
 
 - **ingestion** — MDX cleaning, frontmatter, heading-aware chunking, chunk-id
   stability, oversized splitting, QC rules (short/duplicate/missing metadata),
@@ -278,11 +282,11 @@ placeholder so everything runs without keys.
   fail-fast-on-400, usage plumbing (all via mocked HTTP)
 - **api** — health, 503 before ingest, ingest→ask, validation (422), per-request
   feature overrides without leaking into the singleton, trace recording,
-  incremental ingest, and a concurrency test proving a slow provider does not
-  serialize requests
+  incremental ingest, abstained answers served without text, and a concurrency
+  test proving a slow provider does not serialize requests
 - **eval** — recall@k / hit@k / MRR / nDCG / token-F1 / keyword coverage /
-  aggregation / abstention wiring / pricing, eval settings pinned independently
-  of `.env`, plus dataset integrity checks
+  aggregation / abstention wiring / pricing, nDCG crediting each gold doc once,
+  eval settings pinned independently of `.env`, plus dataset integrity checks
   (unique ids, gold docs exist on disk, unanswerable ratio in band)
 
 CI (`.github/workflows/ci.yml`) runs ruff, format check, `mypy --strict`, the test
@@ -300,7 +304,7 @@ app/
   providers.py    embedder / llm / reranker interfaces + implementations
   service.py      composition root
 eval/             dataset.jsonl, run_eval.py, reports/
-tests/            113 tests
+tests/            116 tests
 scripts/          ingest_cli.py, fetch_corpus.sh
 Dockerfile · docker-compose.yml · .github/workflows/ci.yml · Makefile
 ARCHITECTURE.md   design and rationale · CLAUDE.md   guidance for coding agents
