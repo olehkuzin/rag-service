@@ -145,3 +145,22 @@ def test_concurrent_asks_do_not_serialize(
 
     # 4 x 0.4s serialized would be ~1.6s; concurrent should be well under 1.0s
     assert elapsed < 1.0, f"requests serialized on the event loop ({elapsed:.2f}s)"
+
+
+def test_abstained_answer_text_is_not_served(client: TestClient) -> None:
+    """Strict mode downgrades an uncited answer; its text must not reach the client."""
+    from app.service import get_service
+
+    client.post("/ingest", json={"force": True})
+
+    class UncitedLLM:
+        def complete(self, *, system: str, user: str, max_tokens: int):
+            return '{"found": true, "answer": "unsupported claim", "citations": []}', 5, 2
+
+    get_service().generator.llm = UncitedLLM()
+    resp = client.post("/ask", json={"question": "models", "prompt_variant": "strict"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["found"] is False
+    assert body["answer"] == ""
+    assert body["citations"] == []

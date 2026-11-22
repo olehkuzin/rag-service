@@ -21,12 +21,12 @@ import re
 import statistics
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from app.config import Settings, load_env_file
-from app.models import ScoredChunk
 from app.retrieval.pipeline import RetrievalConfig
 from app.service import Service
 
@@ -197,14 +197,21 @@ def reciprocal_rank(retrieved_docs: list[str], gold_docs: list[str]) -> float:
 
 
 def ndcg_at_k(retrieved_docs: list[str], gold_docs: list[str], k: int) -> float:
+    """Binary-relevance nDCG at document level.
+
+    `retrieved_docs` has one entry per retrieved *chunk*, so a doc can repeat. Each
+    gold doc earns gain once, at its first rank; counting every chunk of it would
+    push DCG above the ideal and nDCG above 1.
+    """
     gold = set(gold_docs)
     if not gold:
         return 0.0
-    dcg = sum(
-        1.0 / math.log2(rank + 1)
-        for rank, doc in enumerate(retrieved_docs[:k], start=1)
-        if doc in gold
-    )
+    credited: set[str] = set()
+    dcg = 0.0
+    for rank, doc in enumerate(retrieved_docs[:k], start=1):
+        if doc in gold and doc not in credited:
+            credited.add(doc)
+            dcg += 1.0 / math.log2(rank + 1)
     ideal = sum(1.0 / math.log2(rank + 1) for rank in range(1, min(len(gold), k) + 1))
     return dcg / ideal if ideal else 0.0
 
@@ -231,15 +238,15 @@ def keyword_coverage(prediction: str, keywords: list[str]) -> float:
 
 
 def citation_accuracy(
-    citations: list[str], gold_docs: list[str], retrieved: list[ScoredChunk]
+    cited_chunk_ids: Iterable[str], gold_docs: list[str], doc_path_by_chunk: dict[str, str]
 ) -> float:
-    """Fraction of cited chunks that come from a gold document."""
-    if not citations:
+    """Fraction of distinct cited chunks that come from a gold document."""
+    cited = set(cited_chunk_ids)
+    if not cited:
         return 0.0
-    by_id = {c.chunk.chunk_id: c.chunk.doc_path for c in retrieved}
     gold = set(gold_docs)
-    good = sum(1 for cid in citations if by_id.get(cid) in gold)
-    return good / len(citations)
+    good = sum(1 for cid in cited if doc_path_by_chunk.get(cid) in gold)
+    return good / len(cited)
 
 
 # --------------------------------------------------------------------------
@@ -395,11 +402,7 @@ def run_variant(
                 ndcg = ndcg_at_k(retrieved_paths, q.gold_docs, k)
                 f1 = token_f1(gen.answer, q.reference_answer)
                 kw = keyword_coverage(gen.answer, q.gold_keywords)
-                cited = {c.chunk_id for c in gen.citations}
-                gold_chunk_ids = {
-                    cid for cid, path in chunk_map.items() if path in set(q.gold_docs)
-                }
-                cit = len(cited & gold_chunk_ids) / len(cited) if cited else 0.0
+                cit = citation_accuracy((c.chunk_id for c in gen.citations), q.gold_docs, chunk_map)
             else:
                 recall = hit = rr = ndcg = 1.0  # not applicable; excluded from retrieval avg
                 f1 = kw = cit = 0.0

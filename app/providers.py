@@ -207,8 +207,10 @@ class Reranker(Protocol):
 class LexicalReranker:
     """Offline cross-encoder stand-in: IDF-weighted query-term overlap.
 
-    Cheap, deterministic, and measurably better than raw vector order — enough
-    to demonstrate the reranker stage and let the eval compare with/without it.
+    Cheap and deterministic: it fills the reranker slot so the stage can be
+    wired, tested and toggled in the eval without a key. It is not a quality
+    gain. In the offline eval it lowers MRR and citation accuracy on top of
+    hybrid retrieval (see README), so a real cross-encoder belongs here.
     """
 
     def rerank(self, query: str, passages: Sequence[str]) -> list[float]:

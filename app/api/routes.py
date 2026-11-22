@@ -75,7 +75,10 @@ async def ask(request: AskRequest) -> AskResponse:
         )
 
     return AskResponse(
-        answer=result.answer,
+        # An abstention never ships text: strict mode downgrades an uncited answer
+        # to found=false but keeps it on the result (and in the trace) for
+        # debugging. Clients only ever see answers that passed the citation check.
+        answer=result.answer if result.found else "",
         found=result.found,
         citations=[
             CitationModel(
