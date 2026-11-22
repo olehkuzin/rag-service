@@ -322,8 +322,7 @@ ARCHITECTURE.md   design and rationale · CLAUDE.md   guidance for coding agents
 Known gaps: no `pre-commit` config (CI runs the same checks); no faithfulness /
 LLM-as-judge metric yet — `citation_accuracy` measures whether a cited chunk
 came from a gold document, **not** whether the answer is supported by the text
-it cites; `langfuse_enabled`, `api_host` and `api_port` are dead config (the
-tracer is local and uvicorn is started manually).
+it cites.
 
 Scope: **local / single-machine deployment only.** There is no cloud deployment,
 autoscaling or managed secrets story here, by choice. Docker Compose is the
