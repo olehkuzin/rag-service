@@ -73,13 +73,6 @@ class Settings(BaseSettings):
     enable_rerank: bool = True
     prompt_variant: str = "strict"  # basic | strict
 
-    # --- observability ---
-    langfuse_enabled: bool = False
-
-    # --- api ---
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
-
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

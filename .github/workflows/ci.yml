@@ -19,15 +19,15 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
-          # no uv.lock in this repo; the default glob (**/uv.lock) fails the step
-          cache-dependency-glob: pyproject.toml
+          # the cache is keyed on the lockfile, so it is invalidated exactly
+          # when the resolved dependency set changes
+          cache-dependency-glob: uv.lock
 
-      # a project venv, like `make install`: the runner's system Python is
-      # externally managed, so `uv pip install --system` is not an option
+      # install the exact versions pinned in uv.lock into the project venv
+      # (.venv, like `make install`); --locked fails if uv.lock is out of date
+      # with pyproject.toml instead of silently re-resolving
       - name: Install dependencies
-        run: |
-          uv venv --python 3.12 .venv
-          uv pip install --python .venv -e ".[dev]"
+        run: uv sync --locked --extra dev --python 3.12
 
       - name: Lint (ruff)
         run: .venv/bin/ruff check .
