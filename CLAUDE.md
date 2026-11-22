@@ -7,9 +7,12 @@ rationale: [ARCHITECTURE.md](ARCHITECTURE.md). Usage and results: [README.md](RE
 
 ```bash
 make install                 # uv venv (.venv, Python 3.12) + editable install with dev extras
+make corpus                  # fetch the dbt docs into data/corpus (needed before the first ingest)
 make test                    # offline pytest suite (~2s): no network, no keys
+.venv/bin/pytest             # same suite, but prints the "N passed" summary line
+.venv/bin/pytest tests/test_retrieval.py::test_concurrent_reads_during_writes_never_fail  # one test
 make lint && make typecheck  # ruff + mypy --strict (app, eval, scripts)
-.venv/bin/ruff format --check .
+.venv/bin/ruff format --check .   # what CI runs; `make format` applies the fixes
 make eval                    # offline eval (hash embedder + fake LLM) -> eval/reports/latest.{json,md}
 make ingest                  # incremental ingest with the providers configured in .env
 make ask                     # interactive question against data/index
@@ -53,7 +56,8 @@ corpus is ~9.2k chunks, ~14 min), and so do `make eval-mistral` and `make ask`.
 - Changing chunking, retrieval or generation changes the eval. Run `make eval` and
   update the README results table and the text that interprets it. Don't leave
   claims the table contradicts.
-- Keep the README test count in sync with `pytest` output.
+- Keep the README test count in sync with `.venv/bin/pytest` output. `make test`
+  passes `-q` on top of `addopts = "-q"`, which hides the summary line.
 - Mistral API quirks are handled in `MistralLLM`: `top_p=1` with temperature 0,
   chunked message content, and the reasoning-token budget. Keep them when touching
   the client.
